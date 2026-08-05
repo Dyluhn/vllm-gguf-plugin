@@ -16,8 +16,14 @@ from vllm.model_executor.model_loader.utils import (
 )
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from .gguf_files import GGUFModelFiles, resolve_gguf_model_files
+from .gguf_utils import get_remote_gguf_repo_id, resolve_explicit_mm_proj
 from .quantization import GGUFConfig
-from .weight_utils import download_gguf, resolve_local_gguf
+from .weight_utils import (
+    download_gguf,
+    download_mmproj,
+    resolve_local_gguf,
+)
 from .weights_adapter import get_weights_adapter
 
 logger = init_logger(__name__)
@@ -32,11 +38,14 @@ class GGUFModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        if load_config.model_loader_extra_config:
+        extra_config = load_config.model_loader_extra_config or {}
+        unknown_options = set(extra_config) - {"mm_proj"}
+        if unknown_options:
             raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
+                "Unsupported GGUF model loader extra config options: "
+                f"{sorted(unknown_options)}"
             )
+        self._mm_proj_reference = extra_config.get("mm_proj")
 
     def _prepare_weights(self, model_config: ModelConfig):
         model_name_or_path = model_config.model_weights or model_config.model
@@ -66,39 +75,64 @@ class GGUFModelLoader(BaseModelLoader):
             "<repo_id>/<filename>.gguf, or <repo_id>:<quant_type>)"
         )
 
+    def _prepare_model_files(self, model_config: ModelConfig) -> GGUFModelFiles:
+        model_reference = model_config.model_weights or model_config.model
+        model_path = self._prepare_weights(model_config)
+        files = resolve_gguf_model_files(model_path)
+        if self._mm_proj_reference is not None:
+            mm_proj_path = resolve_explicit_mm_proj(
+                self._mm_proj_reference,
+                model_path,
+                cache_dir=self.load_config.download_dir,
+                revision=model_config.revision,
+            )
+            return resolve_gguf_model_files(model_path, mm_proj_path)
+
+        if (
+            files.mm_proj is None
+            and getattr(model_config.hf_config, "vision_config", None) is not None
+        ):
+            repo_id = get_remote_gguf_repo_id(model_reference)
+            if repo_id is not None:
+                mm_proj_path = download_mmproj(
+                    repo_id,
+                    cache_dir=self.load_config.download_dir,
+                    revision=model_config.revision,
+                )
+                if mm_proj_path is not None:
+                    return resolve_gguf_model_files(model_path, mm_proj_path)
+
+        return files
+
     def _prepare_adapter(self, model_config: ModelConfig):
-        local_model_path = self._prepare_weights(model_config)
+        files = self._prepare_model_files(model_config)
         adapter = get_weights_adapter(model_config.hf_config)
-        adapter.prepare_loading(local_model_path, model_config)
-        return adapter
+        plan = adapter.prepare(files, model_config)
+        return adapter, plan
 
     def download_model(self, model_config: ModelConfig) -> None:
-        self._prepare_weights(model_config)
+        self._prepare_model_files(model_config)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
-        adapter = self._prepare_adapter(model_config)
-        model.load_weights(adapter.prepare_weights(model_config))
+        adapter, plan = self._prepare_adapter(model_config)
+        model.load_weights(adapter.iter_weights(plan, model_config))
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
         device_config = vllm_config.device_config
-        adapter = self._prepare_adapter(model_config)
+        adapter, plan = self._prepare_adapter(model_config)
         vllm_config.model_config.hf_config = model_config.hf_config
-        logger.debug(
-            "GGUF unquantized modules: %s", adapter.load_spec.unquantized_modules
-        )
+        logger.debug("GGUF unquantized modules: %s", plan.unquantized_modules)
         vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
-        vllm_config.quant_config.unquantized_modules.extend(
-            adapter.load_spec.unquantized_modules
-        )
+        vllm_config.quant_config.unquantized_modules.extend(plan.unquantized_modules)
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = initialize_model(vllm_config=vllm_config, prefix=prefix)
             model.load_weights(
-                adapter.prepare_weights(model_config),
+                adapter.iter_weights(plan, model_config),
             )
             process_weights_after_loading(model, model_config, target_device)
         return model
