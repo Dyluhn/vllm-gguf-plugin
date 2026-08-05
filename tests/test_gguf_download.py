@@ -11,6 +11,7 @@ import vllm_gguf_plugin.loader as loader_module
 from vllm_gguf_plugin.gguf_files import GGUFModelFiles
 from vllm_gguf_plugin.loader import GGUFModelLoader
 from vllm_gguf_plugin.weight_utils import download_gguf, download_mmproj
+from vllm_gguf_plugin.weights_adapter import ModelLoadSource
 
 
 class TestGGUFDownload:
@@ -269,3 +270,45 @@ class TestGGUFModelLoader:
             ("/cache/model-Q4_0.gguf", None),
             ("/cache/model-Q4_0.gguf", "/cache/mmproj-BF16.gguf"),
         ]
+
+    def test_redirected_model_temporarily_applies_source(self, monkeypatch):
+        sentinel = object()
+        calls = []
+
+        class FakeLoader:
+            def load_model(self, **kwargs):
+                calls.append(kwargs)
+                assert kwargs["vllm_config"].quant_config is None
+                assert kwargs["model_config"].quantization is None
+                assert kwargs["model_config"].model == "/cache/alternate"
+                return sentinel
+
+        monkeypatch.setattr(
+            "vllm.model_executor.model_loader.get_model_loader",
+            lambda load_config: FakeLoader(),
+        )
+        loader = GGUFModelLoader(LoadConfig(load_format="gguf"))
+        quant_config = object()
+        vllm_config = SimpleNamespace(quant_config=quant_config)
+        model_config = SimpleNamespace(
+            model="original/model",
+            model_weights=None,
+            quantization="gguf",
+            hf_config=SimpleNamespace(model_type="draft"),
+        )
+        source = ModelLoadSource(
+            model="/cache/alternate",
+            load_format="auto",
+            quantization=None,
+        )
+
+        result = loader._load_redirected_model(
+            source, vllm_config, model_config, "draft"
+        )
+
+        assert result is sentinel
+        assert calls[0]["prefix"] == "draft"
+        assert vllm_config.quant_config is quant_config
+        assert model_config.quantization == "gguf"
+        assert model_config.model == "original/model"
+        assert model_config.model_weights is None

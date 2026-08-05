@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from ..gguf_files import GGUFModelFiles
-from .base import BaseGGUFWeightsAdapter, GGUFLoadPlan
+from .base import BaseGGUFWeightsAdapter, GGUFLoadPlan, ModelLoadSource
 from .diffusion import (
     DiffusionGGUFAdapter,
     Flux2KleinDiffusionGGUFAdapter,
@@ -11,10 +11,13 @@ from .diffusion import (
     get_diffusion_gguf_adapter,
 )
 from .gemma3 import Gemma3GGUFAdapter
+from .qwen3_5 import Qwen35GGUFAdapter, Qwen35MtpGGUFAdapter
 from .transformers import TransformersGGUFWeightsAdapter
 
 _ADAPTER_REGISTRY: list[type[BaseGGUFWeightsAdapter]] = [
     Gemma3GGUFAdapter,
+    Qwen35GGUFAdapter,
+    Qwen35MtpGGUFAdapter,
 ]
 
 
@@ -26,6 +29,14 @@ def get_weights_adapter(config) -> BaseGGUFWeightsAdapter:
     return TransformersGGUFWeightsAdapter()
 
 
+def get_adapter_architecture(config) -> str | None:
+    """Return an architecture override declared by a registered adapter."""
+    for cls in _ADAPTER_REGISTRY:
+        if cls.matches(config):
+            return cls.architecture(config)
+    return None
+
+
 __all__ = [
     "BaseGGUFWeightsAdapter",
     "DiffusionGGUFAdapter",
@@ -33,9 +44,13 @@ __all__ = [
     "GGUFLoadPlan",
     "GGUFModelFiles",
     "Gemma3GGUFAdapter",
+    "ModelLoadSource",
     "QwenImageDiffusionGGUFAdapter",
+    "Qwen35GGUFAdapter",
+    "Qwen35MtpGGUFAdapter",
     "TransformersGGUFWeightsAdapter",
     "ZImageDiffusionGGUFAdapter",
     "get_diffusion_gguf_adapter",
+    "get_adapter_architecture",
     "get_weights_adapter",
 ]

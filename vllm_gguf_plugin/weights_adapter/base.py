@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
     from vllm.config import ModelConfig
 
+    from ..quantization.config import GGUFConfig
+
 
 GGUFWeight = tuple[str, torch.Tensor]
 
@@ -35,6 +37,20 @@ class GGUFLoadPlan:
     selected_tensors: frozenset[str] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ModelLoadSource:
+    """An adapter-selected source for loading a draft model.
+
+    ``load_format=None`` keeps using this GGUF loader with ``model`` as the
+    weights reference. Any explicit format delegates to vLLM's corresponding
+    loader.
+    """
+
+    model: str
+    load_format: str | None = None
+    quantization: str | None = None
+
+
 class BaseGGUFWeightsAdapter(ABC):
     """Model-specific GGUF name mapping and tensor transformation hooks."""
 
@@ -42,6 +58,23 @@ class BaseGGUFWeightsAdapter(ABC):
     @abstractmethod
     def matches(cls, config: PretrainedConfig) -> bool:
         """Return whether this adapter supports *config*."""
+
+    @classmethod
+    def architecture(cls, config: PretrainedConfig) -> str | None:
+        """Return an architecture override required before model loading."""
+        del config
+        return None
+
+    def resolve_model_source(
+        self,
+        model_config: ModelConfig,
+        target_model_config: ModelConfig,
+        target_files: GGUFModelFiles,
+        download_dir: str | None,
+    ) -> ModelLoadSource | None:
+        """Optionally select where a separately initialized draft is loaded."""
+        del model_config, target_model_config, target_files, download_dir
+        return None
 
     @abstractmethod
     def build_name_map(
@@ -134,6 +167,16 @@ class BaseGGUFWeightsAdapter(ABC):
             selected_tensors=plan.selected_tensors,
         )
         yield from self.transform_weights(weights, model_config)
+
+    def configure_model(
+        self,
+        model: torch.nn.Module,
+        plan: GGUFLoadPlan,
+        model_config: ModelConfig,
+        quant_config: GGUFConfig,
+    ) -> None:
+        """Apply model-specific adjustments after init and before loading."""
+        del model, plan, model_config, quant_config
 
     def transform_weights(
         self,

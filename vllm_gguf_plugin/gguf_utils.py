@@ -298,7 +298,10 @@ def extract_vision_config_from_gguf(mmproj_path: str) -> "SiglipVisionConfig | N
             )
             return None
         # Extract scalar value from GGUF field and convert to target type
-        config_params[param_name] = dtype(field.parts[-1])
+        value = field.parts[-1]
+        if hasattr(value, "item"):
+            value = value.item()
+        config_params[param_name] = dtype(value)
 
     # Apply model-specific parameters based on projector type
     if projector_type == VisionProjectorType.GEMMA3:

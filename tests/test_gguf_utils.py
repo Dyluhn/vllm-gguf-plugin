@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
+from gguf.constants import Keys
 
 from vllm_gguf_plugin.gguf_utils import (
     extract_lm_head_from_gguf,
+    extract_vision_config_from_gguf,
     get_remote_gguf_repo_id,
     is_gguf,
     is_local_gguf_quant,
@@ -303,3 +307,34 @@ class TestExtractLMHeadFromGGUF:
         ]
 
         assert extract_lm_head_from_gguf("/tmp/model.gguf")
+
+
+class TestExtractVisionConfigFromGGUF:
+    @patch("vllm_gguf_plugin.gguf_utils.gguf.GGUFReader")
+    def test_converts_numpy_array_fields_to_scalars(self, mock_reader_cls):
+        values = {
+            Keys.ClipVision.EMBEDDING_LENGTH: 32,
+            Keys.ClipVision.FEED_FORWARD_LENGTH: 64,
+            Keys.ClipVision.BLOCK_COUNT: 2,
+            Keys.ClipVision.Attention.HEAD_COUNT: 4,
+            Keys.ClipVision.IMAGE_SIZE: 28,
+            Keys.ClipVision.PATCH_SIZE: 14,
+            Keys.ClipVision.Attention.LAYERNORM_EPS: 1e-6,
+        }
+
+        def get_field(key):
+            if key == Keys.Clip.PROJECTOR_TYPE:
+                return None
+            return SimpleNamespace(parts=[np.array([values[key]])])
+
+        mock_reader_cls.return_value.get_field.side_effect = get_field
+
+        config = extract_vision_config_from_gguf("/tmp/mmproj.gguf")
+
+        assert config.hidden_size == 32
+        assert config.intermediate_size == 64
+        assert config.num_hidden_layers == 2
+        assert config.num_attention_heads == 4
+        assert config.image_size == 28
+        assert config.patch_size == 14
+        assert config.layer_norm_eps == pytest.approx(1e-6)

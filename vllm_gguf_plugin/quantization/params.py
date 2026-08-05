@@ -42,6 +42,10 @@ def _resolve_gguf_weight_type_loader(
         if loaded_shard_id is None and hasattr(param, "_store"):
             param._store(loaded_weight)
             return
+        if isinstance(loaded_shard_id, tuple) and hasattr(param, "_store"):
+            for shard_id in loaded_shard_id:
+                param._store(loaded_weight, shard_id=shard_id)
+            return
         base_loader(param, loaded_weight, loaded_shard_id)
 
     return _gguf_weight_type_loader_v2

@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 
 from ..gguf_files import GGUFModelFiles
 from ..gguf_utils import maybe_patch_hf_config_from_gguf
+from ..weight_utils import split_stacked_experts
 from .base import BaseGGUFWeightsAdapter, GGUFWeight
 
 if TYPE_CHECKING:
@@ -239,12 +240,4 @@ class TransformersGGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         model_config: ModelConfig,
     ) -> Iterable[GGUFWeight]:
         del model_config
-        for hf_name, weight in weights:
-            if weight.ndim == 3 and ".experts.0." in hf_name:
-                for expert_id, expert_weight in enumerate(weight.unbind()):
-                    expert_name = hf_name.replace(
-                        ".experts.0.", f".experts.{expert_id}."
-                    )
-                    yield expert_name, expert_weight
-            else:
-                yield hf_name, weight
+        yield from split_stacked_experts(weights)
