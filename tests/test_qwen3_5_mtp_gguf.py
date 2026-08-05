@@ -11,16 +11,16 @@ from vllm import LLM, SamplingParams
 
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_qwen35_gguf_with_hf_mtp_fallback():
-    repo_id = "unsloth/Qwen3.5-0.8B-GGUF"
-    hf_hub_download(repo_id, filename="mmproj-BF16.gguf")
+def test_qwen35_gguf_with_embedded_mtp():
+    repo_id = "unsloth/Qwen3.5-4B-MTP-GGUF"
+    hf_hub_download(repo_id, filename="mmproj-F16.gguf")
     backbone = hf_hub_download(
         repo_id,
-        filename="Qwen3.5-0.8B-Q4_K_M.gguf",
+        filename="Qwen3.5-4B-Q4_K_M.gguf",
     )
     llm = LLM(
         model=backbone,
-        tokenizer="Qwen/Qwen3.5-0.8B",
+        tokenizer="Qwen/Qwen3.5-4B",
         dtype="bfloat16",
         enforce_eager=True,
         max_model_len=1024,

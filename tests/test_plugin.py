@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import vllm.engine.arg_utils as arg_utils_module
@@ -272,6 +274,37 @@ def test_register_sets_engine_args_for_gguf_model(monkeypatch):
     assert captured["model_weights"] == "/tmp/model.gguf"
     assert captured["quantization"] == "gguf"
     assert engine_args.load_format == "gguf"
+
+
+def test_gguf_mtp_draft_reuses_target_weights(monkeypatch):
+    register()
+    captured = {}
+
+    def fake_speculative_config(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            method="mtp",
+            draft_model_config=SimpleNamespace(model_weights=None),
+        )
+
+    monkeypatch.setattr(
+        arg_utils_module,
+        "SpeculativeConfig",
+        fake_speculative_config,
+    )
+    engine_args = EngineArgs(
+        model="Qwen/Qwen3.5-4B",
+        speculative_config={
+            "method": "mtp",
+            "num_speculative_tokens": 1,
+        },
+    )
+    engine_args.model_weights = "/tmp/qwen3.5-mtp.gguf"
+
+    config = engine_args.create_speculative_config(SimpleNamespace(), SimpleNamespace())
+
+    assert captured["target_model_config"] is not None
+    assert config.draft_model_config.model_weights == "/tmp/qwen3.5-mtp.gguf"
 
 
 def test_register_skips_speculator_probe_for_gguf():

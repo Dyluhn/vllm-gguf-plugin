@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import json
-import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -12,7 +10,6 @@ from typing import TYPE_CHECKING
 
 import gguf
 import torch
-from huggingface_hub import hf_hub_download
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import WeightsMapper
 
@@ -22,12 +19,7 @@ from ..quantization.config import GGUFConfig
 from ..quantization.linear import GGUFLinearMethod
 from ..quantization.vocal_embeds import GGUFEmbeddingMethod
 from ..weight_utils import get_gguf_tensor_names, split_stacked_experts
-from .base import (
-    BaseGGUFWeightsAdapter,
-    GGUFLoadPlan,
-    GGUFWeight,
-    ModelLoadSource,
-)
+from .base import BaseGGUFWeightsAdapter, GGUFLoadPlan, GGUFWeight
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -161,42 +153,6 @@ def _find_nextn_block_index(gguf_files: list[str]) -> int | None:
     return None
 
 
-def _prefetch_mtp_weights(
-    model_config: ModelConfig,
-    download_dir: str | None,
-) -> str | None:
-    """Download only HF safetensors shards containing Qwen MTP parameters."""
-    repo_id = str(model_config.model)
-    if os.path.isdir(repo_id):
-        return None
-    try:
-        index_path = hf_hub_download(
-            repo_id,
-            "model.safetensors.index.json",
-            cache_dir=download_dir,
-            revision=model_config.revision,
-        )
-    except Exception as error:
-        logger.info("No MTP shard index for %s (%s)", repo_id, error)
-        return None
-    with open(index_path) as index_file:
-        weight_map = json.load(index_file)["weight_map"]
-    shards = sorted(
-        {shard for name, shard in weight_map.items() if "mtp" in name.lower()}
-    )
-    if not shards:
-        return None
-    logger.info("Prefetching %d MTP shard(s): %s", len(shards), shards)
-    for shard in shards:
-        hf_hub_download(
-            repo_id,
-            shard,
-            cache_dir=download_dir,
-            revision=model_config.revision,
-        )
-    return os.path.dirname(index_path)
-
-
 def qwen35_layer_substr(is_moe: bool) -> dict[str, str]:
     """Within-layer renames shared by the target and MTP draft."""
     mlp_substr = QWEN35_MOE_SUBSTR if is_moe else QWEN35_DENSE_SUBSTR
@@ -295,7 +251,10 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
             mmproj_path=files.mm_proj,
         )
         architecture = self.architecture(patched) or self.architecture(hf_config)
-        if files.mm_proj is not None and getattr(patched, "vision_config", None) is None:
+        if (
+            files.mm_proj is not None
+            and getattr(patched, "vision_config", None) is None
+        ):
             if patched.model_type in ("qwen3_5", "qwen3_5_text"):
                 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
 
@@ -393,13 +352,11 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
         embeddings = [
             module
             for name, module in model.named_modules()
-            if name.endswith("embed_tokens")
-            and type(module) is VocabParallelEmbedding
+            if name.endswith("embed_tokens") and type(module) is VocabParallelEmbedding
         ]
         if len(embeddings) != 1:
             raise RuntimeError(
-                "Expected exactly one Qwen3.5 token embedding, found "
-                f"{len(embeddings)}"
+                f"Expected exactly one Qwen3.5 token embedding, found {len(embeddings)}"
             )
         _enable_gguf_embedding(embeddings[0], quant_config)
 
@@ -514,28 +471,6 @@ class Qwen35MtpGGUFAdapter(BaseGGUFWeightsAdapter):
     @classmethod
     def matches(cls, config) -> bool:
         return config.model_type in QWEN35_MTP_MODEL_TYPES
-
-    def resolve_model_source(
-        self,
-        model_config: ModelConfig,
-        target_model_config: ModelConfig,
-        target_files: GGUFModelFiles,
-        download_dir: str | None,
-    ) -> ModelLoadSource:
-        if _find_nextn_block_index(list(target_files.backbone)) is not None:
-            model = target_model_config.model_weights or target_model_config.model
-            return ModelLoadSource(model=str(model))
-
-        logger.info(
-            "Qwen3.5 GGUF has no nextn block; loading draft from HF repo %s",
-            model_config.model,
-        )
-        snapshot = _prefetch_mtp_weights(model_config, download_dir)
-        return ModelLoadSource(
-            model=snapshot or str(model_config.model),
-            load_format="auto",
-            quantization=None,
-        )
 
     def build_name_map(
         self,

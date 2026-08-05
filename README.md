@@ -61,14 +61,17 @@ The same hooks also run in GitHub Actions on every push and pull request.
 vllm serve Qwen/Qwen3-0.6B-GGUF:Q8_0 --tokenizer Qwen/Qwen3-0.6B
 ```
 
-Qwen 3.5 MTP speculative decoding works with either a GGUF that contains a
-`nextn` block or the matching Hugging Face MTP weights as a fallback:
+Qwen 3.5 MTP speculative decoding loads the `nextn` block embedded in the same
+GGUF; it does not download separate Hugging Face MTP weights:
 
 ```bash
-vllm serve unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M \
-  --tokenizer Qwen/Qwen3.5-0.8B \
+vllm serve unsloth/Qwen3.5-4B-MTP-GGUF:Q4_K_M \
+  --tokenizer Qwen/Qwen3.5-4B \
   --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
 ```
+
+For a GGUF without a `nextn` block, omit `--speculative-config`; the backbone
+loads normally without MTP.
 
 ## Tested model coverage
 

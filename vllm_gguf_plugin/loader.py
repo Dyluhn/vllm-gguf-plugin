@@ -24,7 +24,7 @@ from .weight_utils import (
     download_mmproj,
     resolve_local_gguf,
 )
-from .weights_adapter import ModelLoadSource, get_weights_adapter
+from .weights_adapter import get_weights_adapter
 
 logger = init_logger(__name__)
 
@@ -117,75 +117,11 @@ class GGUFModelLoader(BaseModelLoader):
         adapter, plan = self._prepare_adapter(model_config)
         model.load_weights(adapter.iter_weights(plan, model_config))
 
-    def _load_redirected_model(
-        self,
-        source: ModelLoadSource,
-        vllm_config: VllmConfig,
-        model_config: ModelConfig,
-        prefix: str,
-    ) -> nn.Module:
-        """Delegate an adapter-selected source to another vLLM loader."""
-        from vllm.model_executor.model_loader import get_model_loader
-
-        logger.info(
-            "Loading %s from %s with the %s loader",
-            getattr(model_config.hf_config, "model_type", "model"),
-            source.model,
-            source.load_format,
-        )
-        saved_quant_config = vllm_config.quant_config
-        saved_quantization = model_config.quantization
-        saved_model = model_config.model
-        saved_model_weights = model_config.model_weights
-        vllm_config.quant_config = None
-        model_config.quantization = source.quantization
-        model_config.model_weights = None
-        model_config.model = source.model
-        try:
-            loader = get_model_loader(
-                LoadConfig(
-                    load_format=source.load_format,
-                    download_dir=self.load_config.download_dir,
-                )
-            )
-            return loader.load_model(
-                vllm_config=vllm_config,
-                model_config=model_config,
-                prefix=prefix,
-            )
-        finally:
-            vllm_config.quant_config = saved_quant_config
-            model_config.quantization = saved_quantization
-            model_config.model = saved_model
-            model_config.model_weights = saved_model_weights
-
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
-        target_model_config = vllm_config.model_config
-        is_draft = model_config is not target_model_config
-        if is_draft and not model_config.model_weights:
-            source_adapter = get_weights_adapter(model_config.hf_config)
-            source = source_adapter.resolve_model_source(
-                model_config,
-                target_model_config,
-                self._prepare_model_files(target_model_config),
-                self.load_config.download_dir,
-            )
-            if source is not None:
-                if source.load_format is not None:
-                    return self._load_redirected_model(
-                        source,
-                        vllm_config,
-                        model_config,
-                        prefix,
-                    )
-                model_config.model_weights = source.model
-
         device_config = vllm_config.device_config
         adapter, plan = self._prepare_adapter(model_config)
-        if not is_draft:
-            vllm_config.model_config.hf_config = model_config.hf_config
         logger.debug("GGUF unquantized modules: %s", plan.unquantized_modules)
         vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
         vllm_config.quant_config.unquantized_modules.extend(plan.unquantized_modules)

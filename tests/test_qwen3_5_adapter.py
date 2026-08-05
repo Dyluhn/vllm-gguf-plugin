@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import json
 from types import SimpleNamespace
 
 import gguf
@@ -66,9 +65,7 @@ def test_qwen35_adapter_does_not_match_other_models(model_type):
         ("qwen3_5_moe_text", "Qwen3_5MoeForConditionalGeneration"),
     ],
 )
-def test_patch_config_enforces_qwen_architecture(
-    monkeypatch, model_type, architecture
-):
+def test_patch_config_enforces_qwen_architecture(monkeypatch, model_type, architecture):
     config = PretrainedConfig(
         model_type=model_type,
         architectures=["Qwen3_5ForCausalLM"],
@@ -285,9 +282,7 @@ def test_configure_model_installs_qwen_gdn_out_proj_method():
 
 def test_configure_model_enables_packed_token_embedding(monkeypatch):
     monkeypatch.setattr(vocab_module, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(
-        vocab_module, "get_tensor_model_parallel_world_size", lambda: 1
-    )
+    monkeypatch.setattr(vocab_module, "get_tensor_model_parallel_world_size", lambda: 1)
     embedding = VocabParallelEmbedding(
         num_embeddings=10,
         embedding_dim=4,
@@ -328,9 +323,7 @@ def test_runtime_input_reorder_matches_logical_weight_reorder():
         head_dim=1,
     )
     logical_input = torch.randn(3, 8)
-    quant_method = _Qwen35OutProjGGUFLinearMethod(
-        GGUFConfig(), repeat=4, head_dim=1
-    )
+    quant_method = _Qwen35OutProjGGUFLinearMethod(GGUFConfig(), repeat=4, head_dim=1)
     packed_input = quant_method.reorder_input(logical_input)
 
     assert torch.allclose(
@@ -442,89 +435,17 @@ def test_find_nextn_block_index_across_shards(monkeypatch):
     ]
     monkeypatch.setattr(qwen_module.gguf, "GGUFReader", lambda path: readers.pop(0))
 
-    assert qwen_module._find_nextn_block_index(
-        ["part-1.gguf", "part-2.gguf"]
-    ) == 40
+    assert qwen_module._find_nextn_block_index(["part-1.gguf", "part-2.gguf"]) == 40
 
 
-def test_mtp_source_uses_target_gguf_when_nextn_exists(monkeypatch):
-    monkeypatch.setattr(qwen_module, "_find_nextn_block_index", lambda files: 40)
-    draft_config = SimpleNamespace(model="Qwen/Qwen3.5-0.8B", revision="main")
-    target_config = SimpleNamespace(
-        model="/models/qwen.gguf",
-        model_weights="/models/qwen.gguf",
-    )
-
-    source = Qwen35MtpGGUFAdapter().resolve_model_source(
-        draft_config,
-        target_config,
-        GGUFModelFiles(("part-1.gguf", "part-2.gguf")),
-        "/cache",
-    )
-
-    assert source.model == "/models/qwen.gguf"
-    assert source.load_format is None
-
-
-def test_mtp_source_falls_back_to_hf_when_nextn_is_absent(monkeypatch):
+def test_mtp_build_name_map_rejects_gguf_without_nextn(monkeypatch):
     monkeypatch.setattr(qwen_module, "_find_nextn_block_index", lambda files: None)
-    monkeypatch.setattr(
-        qwen_module,
-        "_prefetch_mtp_weights",
-        lambda config, download_dir: "/cache/mtp-only",
-    )
-    draft_config = SimpleNamespace(model="Qwen/Qwen3.5-0.8B", revision="main")
+    model_config = SimpleNamespace(hf_config=PretrainedConfig(model_type="qwen3_5_mtp"))
 
-    source = Qwen35MtpGGUFAdapter().resolve_model_source(
-        draft_config,
-        SimpleNamespace(model="/models/qwen.gguf", model_weights=None),
-        GGUFModelFiles(("model.gguf",)),
-        "/cache",
-    )
-
-    assert source.model == "/cache/mtp-only"
-    assert source.load_format == "auto"
-    assert source.quantization is None
-
-
-def test_prefetch_mtp_weights_downloads_only_mtp_shards(tmp_path, monkeypatch):
-    index_path = tmp_path / "model.safetensors.index.json"
-    index_path.write_text(
-        json.dumps(
-            {
-                "weight_map": {
-                    "model.layers.0.weight": "model-00001.safetensors",
-                    "mtp.layers.0.weight": "model-00002.safetensors",
-                    "mtp.fc.weight": "model-00002.safetensors",
-                }
-            }
+    with pytest.raises(RuntimeError, match="No MTP/nextn block"):
+        Qwen35MtpGGUFAdapter().build_name_map(
+            GGUFModelFiles(("model.gguf",)), model_config
         )
-    )
-    calls = []
-
-    def fake_download(repo_id, filename, **kwargs):
-        calls.append((repo_id, filename, kwargs))
-        if filename == "model.safetensors.index.json":
-            return str(index_path)
-        return str(tmp_path / filename)
-
-    monkeypatch.setattr(qwen_module, "hf_hub_download", fake_download)
-    model_config = SimpleNamespace(
-        model="Qwen/Qwen3.5-0.8B",
-        revision="main",
-    )
-
-    result = qwen_module._prefetch_mtp_weights(model_config, "/cache")
-
-    assert result == str(tmp_path)
-    assert [filename for _, filename, _ in calls] == [
-        "model.safetensors.index.json",
-        "model-00002.safetensors",
-    ]
-    assert all(
-        kwargs == {"cache_dir": "/cache", "revision": "main"}
-        for *_, kwargs in calls
-    )
 
 
 def test_mtp_build_name_map_selects_only_nextn_block(monkeypatch):
