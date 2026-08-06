@@ -238,8 +238,8 @@ class _GGUFParamLoadMixin:
     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
-        input_transform = getattr(self, "gguf_input_transform", None)
-        if tp_size > 1 and input_transform is not None:
+        layout = getattr(self, "gguf_layout", None)
+        if tp_size > 1 and layout is not None:
             weight_type_param = self.gguf_weight_type_parameter
             weight_type = weight_type_param.weight_type
             try:
@@ -249,7 +249,7 @@ class _GGUFParamLoadMixin:
                     f"Unknown GGUF weight type {weight_type} while sharding "
                     "a transformed row-parallel weight"
                 ) from error
-            loaded_weight = input_transform.shard_weight(
+            loaded_weight = layout.shard_weight(
                 loaded_weight,
                 dim=self.input_dim,
                 logical_size=self.gguf_logical_input_size,

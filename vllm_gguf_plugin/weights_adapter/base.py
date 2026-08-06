@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
     from ..quantization.config import GGUFConfig
-    from ..quantization.layout import GGUFLinearInputTransform
+    from ..quantization.layout import GGUFLinearLayout
 
 
 GGUFWeight = tuple[str, torch.Tensor]
@@ -36,9 +36,7 @@ class GGUFLoadPlan:
     name_map: dict[str, str]
     unquantized_modules: tuple[str, ...]
     selected_tensors: frozenset[str] | None = None
-    linear_input_transforms: dict[str, GGUFLinearInputTransform] = field(
-        default_factory=dict
-    )
+    linear_layouts: dict[str, GGUFLinearLayout] = field(default_factory=dict)
 
 
 class BaseGGUFWeightsAdapter(ABC):
@@ -94,7 +92,7 @@ class BaseGGUFWeightsAdapter(ABC):
             name_map,
             selected_tensors,
         )
-        linear_input_transforms = self.get_linear_input_transforms(
+        linear_layouts = self.get_linear_layouts(
             files,
             model_config,
             name_map,
@@ -105,16 +103,16 @@ class BaseGGUFWeightsAdapter(ABC):
             name_map=name_map,
             unquantized_modules=unquantized_modules,
             selected_tensors=selected_tensors,
-            linear_input_transforms=linear_input_transforms,
+            linear_layouts=linear_layouts,
         )
 
-    def get_linear_input_transforms(
+    def get_linear_layouts(
         self,
         files: GGUFModelFiles,
         model_config: ModelConfig,
         name_map: dict[str, str],
-    ) -> dict[str, GGUFLinearInputTransform]:
-        """Describe input layouts required by GGUF linear weights."""
+    ) -> dict[str, GGUFLinearLayout]:
+        """Describe layouts required by GGUF linear weights."""
         del files, model_config, name_map
         return {}
 

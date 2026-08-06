@@ -18,7 +18,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 import vllm_gguf_plugin.weights_adapter.qwen3_5 as qwen_module
 from vllm_gguf_plugin.gguf_files import GGUFModelFiles
 from vllm_gguf_plugin.quantization.config import GGUFConfig
-from vllm_gguf_plugin.quantization.layout import GGUFGroupedToTiledHeads
+from vllm_gguf_plugin.quantization.layout import GGUFHeadTilingLayout
 from vllm_gguf_plugin.quantization.linear import GGUFLinearMethod
 from vllm_gguf_plugin.quantization.params import GGUFUninitializedParameter
 from vllm_gguf_plugin.quantization.vocal_embeds import GGUFEmbeddingMethod
@@ -261,28 +261,28 @@ def test_qwen_gdn_declares_out_proj_input_layout_before_model_init():
     module_name = "model.layers.0.linear_attn.out_proj"
     name_map = {"blk.0.ssm_out.weight": f"{module_name}.weight"}
 
-    transforms = Qwen35GGUFAdapter().get_linear_input_transforms(
+    layouts = Qwen35GGUFAdapter().get_linear_layouts(
         GGUFModelFiles(("model.gguf",)),
         model_config,
         name_map,
     )
 
-    assert transforms == {
-        module_name: GGUFGroupedToTiledHeads(
+    assert layouts == {
+        module_name: GGUFHeadTilingLayout(
             heads_per_group=4,
             head_dim=128,
         )
     }
 
     quant_config = GGUFConfig()
-    quant_config.register_linear_input_transforms(transforms)
+    quant_config.register_linear_layouts(layouts)
     quant_method = quant_config.get_quant_method(
         object.__new__(LinearBase),
         module_name,
     )
 
     assert type(quant_method) is GGUFLinearMethod
-    assert quant_method.input_transform is transforms[module_name]
+    assert quant_method.layout is layouts[module_name]
     other_method = quant_config.get_quant_method(
         object.__new__(LinearBase),
         "model.layers.0.mlp.down_proj",
@@ -290,7 +290,7 @@ def test_qwen_gdn_declares_out_proj_input_layout_before_model_init():
     assert type(other_method) is GGUFLinearMethod
 
     unquantized_config = GGUFConfig(unquantized_modules=[module_name])
-    unquantized_config.register_linear_input_transforms(transforms)
+    unquantized_config.register_linear_layouts(layouts)
     unquantized_method = unquantized_config.get_quant_method(
         object.__new__(LinearBase),
         module_name,
@@ -298,8 +298,8 @@ def test_qwen_gdn_declares_out_proj_input_layout_before_model_init():
     assert isinstance(unquantized_method, UnquantizedLinearMethod)
 
     prefixed_config = GGUFConfig()
-    prefixed_config.register_linear_input_transforms(
-        transforms,
+    prefixed_config.register_linear_layouts(
+        layouts,
         prefix="draft",
     )
     prefixed_method = prefixed_config.get_quant_method(
@@ -307,7 +307,7 @@ def test_qwen_gdn_declares_out_proj_input_layout_before_model_init():
         f"draft.{module_name}",
     )
     assert type(prefixed_method) is GGUFLinearMethod
-    assert prefixed_method.input_transform is transforms[module_name]
+    assert prefixed_method.layout is layouts[module_name]
 
 
 def test_configure_model_enables_packed_token_embedding(monkeypatch):
@@ -349,18 +349,18 @@ def test_runtime_input_reorder_matches_logical_weight_reorder():
         linear_num_key_heads=2,
         linear_key_head_dim=1,
     )
-    transform = GGUFGroupedToTiledHeads(
+    layout = GGUFHeadTilingLayout(
         heads_per_group=4,
         head_dim=1,
     )
-    logical_weight = adapter._reorder_gdn(
+    logical_weight = adapter._restore_gdn_weight(
         "model.layers.0.linear_attn.out_proj.weight",
         stored_weight,
         text_config,
-        transform,
+        layout,
     )
     logical_input = torch.randn(3, 8)
-    packed_input = transform.apply(logical_input)
+    packed_input = layout.input_to_gguf(logical_input)
 
     assert torch.allclose(
         logical_input @ logical_weight.T,
@@ -374,10 +374,10 @@ def test_gdn_row_reorder_operates_on_packed_rows():
         linear_num_key_heads=2,
         linear_key_head_dim=1,
     )
-    layout = GGUFGroupedToTiledHeads(heads_per_group=2, head_dim=1)
+    layout = GGUFHeadTilingLayout(heads_per_group=2, head_dim=1)
     weight = torch.arange(16).reshape(8, 2)
 
-    reordered = adapter._reorder_gdn(
+    reordered = adapter._restore_gdn_weight(
         "model.layers.0.linear_attn.in_proj_qkv.qweight",
         weight,
         text_config,

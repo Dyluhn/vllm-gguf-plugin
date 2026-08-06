@@ -12,7 +12,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .. import ops
-from .layout import GGUFLinearInputTransform
+from .layout import GGUFLinearLayout
 from .params import (
     GGUFUninitializedWeightParameter,
     GGUFUninitializedWeightTypeParameter,
@@ -84,10 +84,10 @@ class GGUFLinearMethod(LinearMethodBase):
     def __init__(
         self,
         quant_config,
-        input_transform: GGUFLinearInputTransform | None = None,
+        layout: GGUFLinearLayout | None = None,
     ) -> None:
         self.quant_config = quant_config
-        self.input_transform = input_transform
+        self.layout = layout
 
     def create_weights(
         self,
@@ -141,11 +141,11 @@ class GGUFLinearMethod(LinearMethodBase):
         set_weight_attrs(qweight_type, extra_weight_attrs)
         layer.register_parameter("qweight_type", qweight_type)
 
-        if self.input_transform is not None:
+        if self.layout is not None:
             set_weight_attrs(
                 qweight,
                 {
-                    "gguf_input_transform": self.input_transform,
+                    "gguf_layout": self.layout,
                     "gguf_logical_input_size": input_size,
                     "gguf_weight_type_parameter": qweight_type,
                 },
@@ -228,8 +228,8 @@ class GGUFLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
 
-        if self.input_transform is not None:
-            x = self.input_transform.apply(x)
+        if self.layout is not None:
+            x = self.layout.input_to_gguf(x)
 
         shard_id = layer.qweight.shard_id
         if shard_id:

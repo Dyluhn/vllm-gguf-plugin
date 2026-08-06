@@ -5,7 +5,7 @@ from .diffusion_config import (
     dequant_gemm_gguf,
 )
 from .fused_moe import GGUFMoEMethod, fused_moe_gguf
-from .layout import GGUFGroupedToTiledHeads, GGUFLinearInputTransform
+from .layout import GGUFHeadTilingLayout, GGUFLinearLayout
 from .linear import GGUFLinearMethod, fused_mul_mat_gguf
 from .params import (
     GGUFUninitializedParameter,
@@ -33,8 +33,8 @@ __all__ = [
     "dequant_gemm_gguf",
     "GGUFConfig",
     "GGUFEmbeddingMethod",
-    "GGUFGroupedToTiledHeads",
-    "GGUFLinearInputTransform",
+    "GGUFHeadTilingLayout",
+    "GGUFLinearLayout",
     "GGUFLinearMethod",
     "GGUFMoEMethod",
     "GGUFUninitializedParameter",

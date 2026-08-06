@@ -125,8 +125,8 @@ class GGUFModelLoader(BaseModelLoader):
         logger.debug("GGUF unquantized modules: %s", plan.unquantized_modules)
         vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
         vllm_config.quant_config.unquantized_modules.extend(plan.unquantized_modules)
-        vllm_config.quant_config.register_linear_input_transforms(
-            plan.linear_input_transforms,
+        vllm_config.quant_config.register_linear_layouts(
+            plan.linear_layouts,
             prefix=prefix,
         )
 

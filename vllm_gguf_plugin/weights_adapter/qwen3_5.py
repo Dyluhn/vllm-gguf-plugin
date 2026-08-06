@@ -20,10 +20,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeConfig
 from ..gguf_files import GGUFModelFiles
 from ..gguf_utils import maybe_patch_hf_config_from_gguf
 from ..quantization.config import GGUFConfig
-from ..quantization.layout import (
-    GGUFGroupedToTiledHeads,
-    GGUFLinearInputTransform,
-)
+from ..quantization.layout import GGUFHeadTilingLayout, GGUFLinearLayout
 from ..quantization.vocal_embeds import GGUFEmbeddingMethod
 from ..weight_utils import get_gguf_tensor_names, split_stacked_experts
 from .base import BaseGGUFWeightsAdapter, GGUFLoadPlan, GGUFWeight
@@ -197,7 +194,7 @@ def _map_tensor_name(mapper: WeightsMapper, name: str) -> str | None:
 
 def _gdn_value_head_layout(
     text_config: PretrainedConfig,
-) -> GGUFGroupedToTiledHeads | None:
+) -> GGUFHeadTilingLayout | None:
     num_key_heads = getattr(text_config, "linear_num_key_heads", 0) or 0
     num_value_heads = getattr(text_config, "linear_num_value_heads", 0) or 0
     if not num_key_heads or not num_value_heads:
@@ -205,7 +202,7 @@ def _gdn_value_head_layout(
     repeat, remainder = divmod(num_value_heads, num_key_heads)
     if remainder or repeat <= 1:
         return None
-    return GGUFGroupedToTiledHeads(
+    return GGUFHeadTilingLayout(
         heads_per_group=repeat,
         head_dim=text_config.linear_value_head_dim,
     )
@@ -289,12 +286,12 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
             )
         return name_map
 
-    def get_linear_input_transforms(
+    def get_linear_layouts(
         self,
         files: GGUFModelFiles,
         model_config: ModelConfig,
         name_map: dict[str, str],
-    ) -> dict[str, GGUFLinearInputTransform]:
+    ) -> dict[str, GGUFLinearLayout]:
         """Match vLLM activations to GGML's tiled GDN output weights."""
         del files
         text_config = model_config.hf_config.get_text_config()
@@ -332,59 +329,35 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
             )
         _enable_gguf_embedding(embeddings[0], quant_config)
 
-    @staticmethod
-    def _inverse_row_reorder(
-        tensor: torch.Tensor,
-        dim: int,
-        num_key_heads: int,
-        repeat: int,
-        head_dim: int,
-    ) -> torch.Tensor:
-        shape = list(tensor.shape)
-        if dim < 0:
-            dim += len(shape)
-        tensor = tensor.reshape(
-            *shape[:dim],
-            repeat,
-            num_key_heads,
-            head_dim,
-            *shape[dim + 1 :],
-        )
-        tensor = tensor.transpose(dim, dim + 1)
-        return tensor.reshape(*shape).contiguous()
-
-    def _reorder_gdn(
+    def _restore_gdn_weight(
         self,
         name: str,
         weight: torch.Tensor,
         text_config: PretrainedConfig,
-        layout: GGUFGroupedToTiledHeads,
+        layout: GGUFHeadTilingLayout,
     ) -> torch.Tensor | None:
         if name.endswith("qweight_type"):
             return None
         base = name.removesuffix(".qweight").removesuffix(".weight")
-        inverse = self._inverse_row_reorder
-        nk = text_config.linear_num_key_heads
-        repeat = layout.heads_per_group
+        num_key_heads = text_config.linear_num_key_heads
         key_dim = text_config.linear_key_head_dim
-        value_dim = layout.head_dim
         if base.endswith("linear_attn.out_proj") and name.endswith(".weight"):
-            return inverse(weight, 1, nk, repeat, value_dim)
+            return layout.weight_to_vllm(weight, dim=1)
         if base.endswith(".A_log"):
-            return inverse(torch.log(-weight), 0, nk, repeat, 1)
+            return layout.weight_to_vllm(torch.log(-weight), dim=0, head_dim=1)
         if base.endswith(".dt_bias"):
-            return inverse(weight, 0, nk, repeat, 1)
+            return layout.weight_to_vllm(weight, dim=0, head_dim=1)
         if base.endswith("linear_attn.in_proj_z"):
-            return inverse(weight, 0, nk, repeat, value_dim)
+            return layout.weight_to_vllm(weight, dim=0)
         if base.endswith(("linear_attn.in_proj_a", "linear_attn.in_proj_b")):
-            return inverse(weight, 0, nk, repeat, 1)
+            return layout.weight_to_vllm(weight, dim=0, head_dim=1)
         if base.endswith("linear_attn.in_proj_qkv"):
-            qk_rows = key_dim * nk * 2
-            value = inverse(weight[qk_rows:], 0, nk, repeat, value_dim)
+            qk_rows = key_dim * num_key_heads * 2
+            value = layout.weight_to_vllm(weight[qk_rows:], dim=0)
             return torch.cat([weight[:qk_rows], value], dim=0)
         if base.endswith("linear_attn.conv1d") and weight.dim() == 2:
-            qk_rows = key_dim * nk * 2
-            value = inverse(weight[qk_rows:], 0, nk, repeat, value_dim)
+            qk_rows = key_dim * num_key_heads * 2
+            value = layout.weight_to_vllm(weight[qk_rows:], dim=0)
             return torch.cat([weight[:qk_rows], value], dim=0).unsqueeze(1)
         return None
 
@@ -402,7 +375,9 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
             patch_embed_parts: dict[str, torch.Tensor] = {}
             for name, weight in weights:
                 if layout is not None:
-                    reordered = self._reorder_gdn(name, weight, text_config, layout)
+                    reordered = self._restore_gdn_weight(
+                        name, weight, text_config, layout
+                    )
                     if reordered is not None:
                         yield name, reordered
                         continue
