@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import gguf
 import torch
 from vllm.logger import init_logger
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.models.utils import WeightsMapper
+from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
+from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeConfig
 
 from ..gguf_files import GGUFModelFiles
 from ..gguf_utils import maybe_patch_hf_config_from_gguf
@@ -92,6 +97,8 @@ _MTP_NORM_SUFFIXES = (
 
 def _enable_gguf_embedding(layer, quant_config: GGUFConfig) -> None:
     """Give Qwen's unquantized-by-construction embedding packed GGUF params."""
+    # TODO: Remove this workaround after vLLM's Qwen3.5 model passes
+    # quant_config and prefix to VocabParallelEmbedding during construction.
     if isinstance(layer.quant_method, GGUFEmbeddingMethod):
         return
 
@@ -220,43 +227,31 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
         files: GGUFModelFiles,
         hf_config: PretrainedConfig,
     ) -> PretrainedConfig:
+        model_type = hf_config.model_type
+        architecture = QWEN35_ARCHITECTURES[model_type]
         patched = maybe_patch_hf_config_from_gguf(
             files.primary_backbone,
             hf_config,
             mmproj_path=files.mm_proj,
         )
-        architecture = self.architecture(patched) or self.architecture(hf_config)
-        if (
-            files.mm_proj is not None
-            and getattr(patched, "vision_config", None) is None
-        ):
-            if patched.model_type in ("qwen3_5", "qwen3_5_text"):
-                from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
+        has_vision = getattr(patched, "vision_config", None) is not None
 
-                patched = Qwen3_5Config(
-                    text_config=patched.to_dict(),
-                    architectures=[architecture],
-                )
-            else:
-                from vllm.transformers_utils.configs.qwen3_5_moe import (
-                    Qwen3_5MoeConfig,
-                )
-
-                patched = Qwen3_5MoeConfig(
-                    text_config=patched.to_dict(),
-                    architectures=[architecture],
-                )
-        if (
-            getattr(patched, "vision_config", None) is not None
-            and files.mm_proj is None
-        ):
+        if has_vision and files.mm_proj is None:
             raise RuntimeError(
                 "Could not find mm_proj for multimodal Qwen3.5/3.6 GGUF. "
                 "Place *mmproj*.gguf beside the backbone or pass "
                 "model_loader_extra_config={'mm_proj': ...}."
             )
-        if architecture is not None:
-            patched.architectures = [architecture]
+
+        if files.mm_proj is not None and not has_vision:
+            config_cls = (
+                Qwen3_5MoeConfig
+                if model_type in QWEN35_MOE_MODEL_TYPES
+                else Qwen3_5Config
+            )
+            patched = config_cls(text_config=patched.to_dict())
+
+        patched.architectures = [architecture]
         return patched
 
     def build_name_map(
@@ -325,10 +320,6 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
         embed_module = embed_name.removesuffix(".weight")
         if embed_module in plan.unquantized_modules:
             return
-
-        from vllm.model_executor.layers.vocab_parallel_embedding import (
-            VocabParallelEmbedding,
-        )
 
         embeddings = [
             module
