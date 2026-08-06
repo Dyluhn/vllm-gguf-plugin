@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -18,12 +19,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.utils import WeightsMapper
+from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 
 from .utils import is_layer_skipped_gguf
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
+
+    from .layout import GGUFLinearInputTransform
 
 
 class GGUFConfig(QuantizationConfig):
@@ -32,6 +35,7 @@ class GGUFConfig(QuantizationConfig):
     def __init__(self, unquantized_modules: list[str] | None = None) -> None:
         super().__init__()
         self.unquantized_modules = unquantized_modules or []
+        self.linear_input_transforms: dict[str, GGUFLinearInputTransform] = {}
 
     def __repr__(self) -> str:
         return "GGUFConfig()"
@@ -76,7 +80,10 @@ class GGUFConfig(QuantizationConfig):
                 prefix, self.unquantized_modules, self.packed_modules_mapping
             ):
                 return UnquantizedLinearMethod()
-            return GGUFLinearMethod(self)
+            return GGUFLinearMethod(
+                self,
+                input_transform=self.linear_input_transforms.get(prefix),
+            )
         if isinstance(layer, VocabParallelEmbedding):
             if is_layer_skipped_gguf(
                 prefix, self.unquantized_modules, self.packed_modules_mapping
@@ -86,6 +93,17 @@ class GGUFConfig(QuantizationConfig):
         if isinstance(layer, RoutedExperts):
             return GGUFMoEMethod(self, layer.moe_config)
         return None
+
+    def register_linear_input_transforms(
+        self,
+        transforms: Mapping[str, "GGUFLinearInputTransform"],
+        prefix: str = "",
+    ) -> None:
+        """Register module input layouts before model initialization."""
+        self.linear_input_transforms.update(
+            (maybe_prefix(prefix, module_name), transform)
+            for module_name, transform in transforms.items()
+        )
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
         """
@@ -98,4 +116,10 @@ class GGUFConfig(QuantizationConfig):
         if self.unquantized_modules is not None:
             self.unquantized_modules = hf_to_vllm_mapper.apply_list(
                 self.unquantized_modules
+            )
+        if self.linear_input_transforms:
+            transforms = self.linear_input_transforms
+            mapped_names = hf_to_vllm_mapper.apply_list(list(transforms))
+            self.linear_input_transforms = dict(
+                zip(mapped_names, transforms.values(), strict=True)
             )

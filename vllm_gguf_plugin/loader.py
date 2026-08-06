@@ -125,6 +125,10 @@ class GGUFModelLoader(BaseModelLoader):
         logger.debug("GGUF unquantized modules: %s", plan.unquantized_modules)
         vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
         vllm_config.quant_config.unquantized_modules.extend(plan.unquantized_modules)
+        vllm_config.quant_config.register_linear_input_transforms(
+            plan.linear_input_transforms,
+            prefix=prefix,
+        )
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):

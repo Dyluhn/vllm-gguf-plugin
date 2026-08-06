@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gguf
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 from vllm.distributed import (
@@ -237,7 +238,26 @@ class _GGUFParamLoadMixin:
     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
-        if tp_size > 1 and loaded_weight.ndim >= 2:
+        input_transform = getattr(self, "gguf_input_transform", None)
+        if tp_size > 1 and input_transform is not None:
+            weight_type_param = self.gguf_weight_type_parameter
+            weight_type = weight_type_param.weight_type
+            try:
+                block_size, _ = gguf.GGML_QUANT_SIZES[weight_type]
+            except KeyError as error:
+                raise ValueError(
+                    f"Unknown GGUF weight type {weight_type} while sharding "
+                    "a transformed row-parallel weight"
+                ) from error
+            loaded_weight = input_transform.shard_weight(
+                loaded_weight,
+                dim=self.input_dim,
+                logical_size=self.gguf_logical_input_size,
+                block_size=block_size,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
+        elif tp_size > 1 and loaded_weight.ndim >= 2:
             shard_size = loaded_weight.shape[1] // tp_size
             if shard_size > 0:
                 loaded_weight = loaded_weight.narrow(

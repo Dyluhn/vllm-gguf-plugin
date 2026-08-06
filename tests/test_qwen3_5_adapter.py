@@ -9,11 +9,16 @@ import torch
 import torch.nn as nn
 import vllm.model_executor.layers.vocab_parallel_embedding as vocab_module
 from transformers import PretrainedConfig
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 import vllm_gguf_plugin.weights_adapter.qwen3_5 as qwen_module
 from vllm_gguf_plugin.gguf_files import GGUFModelFiles
 from vllm_gguf_plugin.quantization.config import GGUFConfig
+from vllm_gguf_plugin.quantization.layout import GGUFGroupedToTiledHeads
 from vllm_gguf_plugin.quantization.linear import GGUFLinearMethod
 from vllm_gguf_plugin.quantization.params import GGUFUninitializedParameter
 from vllm_gguf_plugin.quantization.vocal_embeds import GGUFEmbeddingMethod
@@ -25,8 +30,6 @@ from vllm_gguf_plugin.weights_adapter import (
 )
 from vllm_gguf_plugin.weights_adapter.base import GGUFLoadPlan
 from vllm_gguf_plugin.weights_adapter.qwen3_5 import (
-    _GDNLayout,
-    _Qwen35OutProjGGUFLinearMethod,
     build_qwen35_mtp_mapper,
     build_qwen35_text_mapper,
     build_qwen35_vision_mapper,
@@ -246,7 +249,7 @@ def test_build_name_map_combines_backbone_and_mmproj(monkeypatch):
     assert "blk.1.nextn.eh_proj.weight" not in name_map
 
 
-def test_configure_model_installs_qwen_gdn_out_proj_method():
+def test_qwen_gdn_declares_out_proj_input_layout_before_model_init():
     config = PretrainedConfig(
         model_type="qwen3_5",
         linear_num_key_heads=2,
@@ -255,29 +258,56 @@ def test_configure_model_installs_qwen_gdn_out_proj_method():
         linear_value_head_dim=128,
     )
     model_config = SimpleNamespace(hf_config=config)
-    quant_config = GGUFConfig()
-    model = nn.Module()
-    model.layer = nn.Module()
-    model.layer.linear_attn = nn.Module()
-    model.layer.linear_attn.out_proj = nn.Module()
-    model.layer.linear_attn.out_proj.quant_method = GGUFLinearMethod(quant_config)
-    plan = GGUFLoadPlan(
-        files=GGUFModelFiles(("model.gguf",)),
-        name_map={},
-        unquantized_modules=(),
-    )
+    module_name = "model.layers.0.linear_attn.out_proj"
+    name_map = {"blk.0.ssm_out.weight": f"{module_name}.weight"}
 
-    Qwen35GGUFAdapter().configure_model(
-        model,
-        plan,
+    transforms = Qwen35GGUFAdapter().get_linear_input_transforms(
+        GGUFModelFiles(("model.gguf",)),
         model_config,
-        quant_config,
+        name_map,
     )
 
-    quant_method = model.layer.linear_attn.out_proj.quant_method
-    assert isinstance(quant_method, _Qwen35OutProjGGUFLinearMethod)
-    assert quant_method.repeat == 4
-    assert quant_method.head_dim == 128
+    assert transforms == {
+        module_name: GGUFGroupedToTiledHeads(
+            heads_per_group=4,
+            head_dim=128,
+        )
+    }
+
+    quant_config = GGUFConfig()
+    quant_config.register_linear_input_transforms(transforms)
+    quant_method = quant_config.get_quant_method(
+        object.__new__(LinearBase),
+        module_name,
+    )
+
+    assert type(quant_method) is GGUFLinearMethod
+    assert quant_method.input_transform is transforms[module_name]
+    other_method = quant_config.get_quant_method(
+        object.__new__(LinearBase),
+        "model.layers.0.mlp.down_proj",
+    )
+    assert type(other_method) is GGUFLinearMethod
+
+    unquantized_config = GGUFConfig(unquantized_modules=[module_name])
+    unquantized_config.register_linear_input_transforms(transforms)
+    unquantized_method = unquantized_config.get_quant_method(
+        object.__new__(LinearBase),
+        module_name,
+    )
+    assert isinstance(unquantized_method, UnquantizedLinearMethod)
+
+    prefixed_config = GGUFConfig()
+    prefixed_config.register_linear_input_transforms(
+        transforms,
+        prefix="draft",
+    )
+    prefixed_method = prefixed_config.get_quant_method(
+        object.__new__(LinearBase),
+        f"draft.{module_name}",
+    )
+    assert type(prefixed_method) is GGUFLinearMethod
+    assert prefixed_method.input_transform is transforms[module_name]
 
 
 def test_configure_model_enables_packed_token_embedding(monkeypatch):
@@ -315,16 +345,22 @@ def test_configure_model_enables_packed_token_embedding(monkeypatch):
 def test_runtime_input_reorder_matches_logical_weight_reorder():
     adapter = Qwen35GGUFAdapter()
     stored_weight = torch.arange(48, dtype=torch.float32).reshape(6, 8)
-    logical_weight = adapter._inverse_row_reorder(
-        stored_weight,
-        dim=1,
-        num_key_heads=2,
-        repeat=4,
+    text_config = PretrainedConfig(
+        linear_num_key_heads=2,
+        linear_key_head_dim=1,
+    )
+    transform = GGUFGroupedToTiledHeads(
+        heads_per_group=4,
         head_dim=1,
     )
+    logical_weight = adapter._reorder_gdn(
+        "model.layers.0.linear_attn.out_proj.weight",
+        stored_weight,
+        text_config,
+        transform,
+    )
     logical_input = torch.randn(3, 8)
-    quant_method = _Qwen35OutProjGGUFLinearMethod(GGUFConfig(), repeat=4, head_dim=1)
-    packed_input = quant_method.reorder_input(logical_input)
+    packed_input = transform.apply(logical_input)
 
     assert torch.allclose(
         logical_input @ logical_weight.T,
@@ -334,17 +370,17 @@ def test_runtime_input_reorder_matches_logical_weight_reorder():
 
 def test_gdn_row_reorder_operates_on_packed_rows():
     adapter = Qwen35GGUFAdapter()
-    layout = _GDNLayout(
-        num_key_heads=2,
-        value_head_repeat=2,
-        key_head_dim=1,
-        value_head_dim=1,
+    text_config = PretrainedConfig(
+        linear_num_key_heads=2,
+        linear_key_head_dim=1,
     )
+    layout = GGUFGroupedToTiledHeads(heads_per_group=2, head_dim=1)
     weight = torch.arange(16).reshape(8, 2)
 
     reordered = adapter._reorder_gdn(
         "model.layers.0.linear_attn.in_proj_qkv.qweight",
         weight,
+        text_config,
         layout,
     )
 

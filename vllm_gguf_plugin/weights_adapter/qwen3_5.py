@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import gguf
@@ -16,7 +15,10 @@ from vllm.model_executor.models.utils import WeightsMapper
 from ..gguf_files import GGUFModelFiles
 from ..gguf_utils import maybe_patch_hf_config_from_gguf
 from ..quantization.config import GGUFConfig
-from ..quantization.linear import GGUFLinearMethod
+from ..quantization.layout import (
+    GGUFGroupedToTiledHeads,
+    GGUFLinearInputTransform,
+)
 from ..quantization.vocal_embeds import GGUFEmbeddingMethod
 from ..weight_utils import get_gguf_tensor_names, split_stacked_experts
 from .base import BaseGGUFWeightsAdapter, GGUFLoadPlan, GGUFWeight
@@ -88,43 +90,6 @@ _MTP_NORM_SUFFIXES = (
 )
 
 
-@dataclass(frozen=True, slots=True)
-class _GDNLayout:
-    num_key_heads: int
-    value_head_repeat: int
-    key_head_dim: int
-    value_head_dim: int
-
-
-class _Qwen35OutProjGGUFLinearMethod(GGUFLinearMethod):
-    """Qwen GDN output projection over its packed GGUF column order."""
-
-    def __init__(self, quant_config: GGUFConfig, repeat: int, head_dim: int):
-        super().__init__(quant_config)
-        self.repeat = repeat
-        self.head_dim = head_dim
-
-    def reorder_input(self, x: torch.Tensor) -> torch.Tensor:
-        num_value_heads, remainder = divmod(x.shape[-1], self.head_dim)
-        if remainder or num_value_heads % self.repeat:
-            raise ValueError(
-                "Cannot reorder Qwen3.5 GDN input shape "
-                f"{tuple(x.shape)} with repeat={self.repeat}, "
-                f"head_dim={self.head_dim}"
-            )
-        num_key_heads = num_value_heads // self.repeat
-        shape = (*x.shape[:-1], num_key_heads, self.repeat, self.head_dim)
-        return x.reshape(shape).transpose(-3, -2).reshape(x.shape).contiguous()
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return super().apply(layer, self.reorder_input(x), bias)
-
-
 def _enable_gguf_embedding(layer, quant_config: GGUFConfig) -> None:
     """Give Qwen's unquantized-by-construction embedding packed GGUF params."""
     if isinstance(layer.quant_method, GGUFEmbeddingMethod):
@@ -144,12 +109,23 @@ def _enable_gguf_embedding(layer, quant_config: GGUFConfig) -> None:
     )
 
 
-def _find_nextn_block_index(gguf_files: list[str]) -> int | None:
+def _find_nextn_block_index_from_names(
+    tensor_names: Iterable[str],
+) -> int | None:
     """Return the first Qwen GGUF block containing an MTP/nextn layer."""
+    for name in tensor_names:
+        if match := re.match(r"blk\.(\d+)\.nextn\.", name):
+            return int(match.group(1))
+    return None
+
+
+def _find_nextn_block_index(gguf_files: Iterable[str]) -> int | None:
     for gguf_file in gguf_files:
-        for tensor in gguf.GGUFReader(gguf_file).tensors:
-            if match := re.match(r"blk\.(\d+)\.nextn\.", tensor.name):
-                return int(match.group(1))
+        block_index = _find_nextn_block_index_from_names(
+            tensor.name for tensor in gguf.GGUFReader(gguf_file).tensors
+        )
+        if block_index is not None:
+            return block_index
     return None
 
 
@@ -212,8 +188,9 @@ def _map_tensor_name(mapper: WeightsMapper, name: str) -> str | None:
     return mapped if mapped != name else None
 
 
-def _gdn_layout(model_config: ModelConfig) -> _GDNLayout | None:
-    text_config = model_config.hf_config.get_text_config()
+def _gdn_value_head_layout(
+    text_config: PretrainedConfig,
+) -> GGUFGroupedToTiledHeads | None:
     num_key_heads = getattr(text_config, "linear_num_key_heads", 0) or 0
     num_value_heads = getattr(text_config, "linear_num_value_heads", 0) or 0
     if not num_key_heads or not num_value_heads:
@@ -221,11 +198,9 @@ def _gdn_layout(model_config: ModelConfig) -> _GDNLayout | None:
     repeat, remainder = divmod(num_value_heads, num_key_heads)
     if remainder or repeat <= 1:
         return None
-    return _GDNLayout(
-        num_key_heads=num_key_heads,
-        value_head_repeat=repeat,
-        key_head_dim=text_config.linear_key_head_dim,
-        value_head_dim=text_config.linear_value_head_dim,
+    return GGUFGroupedToTiledHeads(
+        heads_per_group=repeat,
+        head_dim=text_config.linear_value_head_dim,
     )
 
 
@@ -294,11 +269,16 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
         is_moe = config.model_type in QWEN35_MOE_MODEL_TYPES
         text_mapper = build_qwen35_text_mapper(is_multimodal, is_moe)
         vision_mapper = build_qwen35_vision_mapper()
+        tensor_names = sorted(get_gguf_tensor_names(files.all_files))
+        mtp_block_index = _find_nextn_block_index_from_names(tensor_names)
+        mtp_block_prefix = (
+            f"blk.{mtp_block_index}." if mtp_block_index is not None else None
+        )
 
         name_map: dict[str, str] = {}
         unmapped: list[str] = []
-        for name in sorted(get_gguf_tensor_names(files.all_files)):
-            if ".nextn." in name:
+        for name in tensor_names:
+            if mtp_block_prefix is not None and name.startswith(mtp_block_prefix):
                 continue
             mapper = vision_mapper if name.startswith(("v.", "mm.")) else text_mapper
             mapped = _map_tensor_name(mapper, name)
@@ -314,6 +294,24 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
             )
         return name_map
 
+    def get_linear_input_transforms(
+        self,
+        files: GGUFModelFiles,
+        model_config: ModelConfig,
+        name_map: dict[str, str],
+    ) -> dict[str, GGUFLinearInputTransform]:
+        """Match vLLM activations to GGML's tiled GDN output weights."""
+        del files
+        text_config = model_config.hf_config.get_text_config()
+        layout = _gdn_value_head_layout(text_config)
+        if layout is None:
+            return {}
+        return {
+            mapped_name.removesuffix(".weight"): layout
+            for mapped_name in name_map.values()
+            if mapped_name.endswith("linear_attn.out_proj.weight")
+        }
+
     def configure_model(
         self,
         model: torch.nn.Module,
@@ -321,23 +319,6 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
         model_config: ModelConfig,
         quant_config: GGUFConfig,
     ) -> None:
-        layout = _gdn_layout(model_config)
-        if layout is not None:
-            for name, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if not name.endswith("linear_attn.out_proj") or not isinstance(
-                    quant_method, GGUFLinearMethod
-                ):
-                    continue
-                replacement = _Qwen35OutProjGGUFLinearMethod(
-                    quant_config,
-                    layout.value_head_repeat,
-                    layout.value_head_dim,
-                )
-                if hasattr(quant_method, "params_dtype"):
-                    replacement.params_dtype = quant_method.params_dtype
-                module.quant_method = replacement
-
         embed_name = plan.name_map.get("token_embd.weight")
         if embed_name is None:
             return
@@ -385,16 +366,19 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
         self,
         name: str,
         weight: torch.Tensor,
-        layout: _GDNLayout,
+        text_config: PretrainedConfig,
+        layout: GGUFGroupedToTiledHeads,
     ) -> torch.Tensor | None:
         if name.endswith("qweight_type"):
             return None
         base = name.removesuffix(".qweight").removesuffix(".weight")
         inverse = self._inverse_row_reorder
-        nk = layout.num_key_heads
-        repeat = layout.value_head_repeat
-        key_dim = layout.key_head_dim
-        value_dim = layout.value_head_dim
+        nk = text_config.linear_num_key_heads
+        repeat = layout.heads_per_group
+        key_dim = text_config.linear_key_head_dim
+        value_dim = layout.head_dim
+        if base.endswith("linear_attn.out_proj") and name.endswith(".weight"):
+            return inverse(weight, 1, nk, repeat, value_dim)
         if base.endswith(".A_log"):
             return inverse(torch.log(-weight), 0, nk, repeat, 1)
         if base.endswith(".dt_bias"):
@@ -418,7 +402,8 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
         weights: Iterable[GGUFWeight],
         model_config: ModelConfig,
     ) -> Iterable[GGUFWeight]:
-        layout = _gdn_layout(model_config)
+        text_config = model_config.hf_config.get_text_config()
+        layout = _gdn_value_head_layout(text_config)
         vision_config = getattr(model_config.hf_config, "vision_config", None)
         temporal_patch_size = getattr(vision_config, "temporal_patch_size", 1)
 
@@ -426,7 +411,7 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
             patch_embed_parts: dict[str, torch.Tensor] = {}
             for name, weight in weights:
                 if layout is not None:
-                    reordered = self._reorder_gdn(name, weight, layout)
+                    reordered = self._reorder_gdn(name, weight, text_config, layout)
                     if reordered is not None:
                         yield name, reordered
                         continue
@@ -477,12 +462,13 @@ class Qwen35MtpGGUFAdapter(BaseGGUFWeightsAdapter):
         files: GGUFModelFiles,
         model_config: ModelConfig,
     ) -> dict[str, str]:
-        block_index = _find_nextn_block_index(list(files.backbone))
+        block_index = _find_nextn_block_index(files.backbone)
         if block_index is None:
             raise RuntimeError(
                 f"No MTP/nextn block in {files.backbone}; this GGUF cannot "
                 "serve a speculative draft."
             )
+        tensor_names = sorted(get_gguf_tensor_names(files.backbone))
         logger.info("Loading Qwen3.5 MTP draft from GGUF block %d", block_index)
         mapper = build_qwen35_mtp_mapper(
             block_index,
@@ -491,7 +477,7 @@ class Qwen35MtpGGUFAdapter(BaseGGUFWeightsAdapter):
         block_prefix = f"blk.{block_index}."
         name_map: dict[str, str] = {}
         unmapped: list[str] = []
-        for name in sorted(get_gguf_tensor_names(files.backbone)):
+        for name in tensor_names:
             if not name.startswith(block_prefix):
                 continue
             mapped = _map_tensor_name(mapper, name)

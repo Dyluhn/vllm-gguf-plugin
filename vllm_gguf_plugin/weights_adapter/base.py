@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
     from ..quantization.config import GGUFConfig
+    from ..quantization.layout import GGUFLinearInputTransform
 
 
 GGUFWeight = tuple[str, torch.Tensor]
@@ -35,6 +36,9 @@ class GGUFLoadPlan:
     name_map: dict[str, str]
     unquantized_modules: tuple[str, ...]
     selected_tensors: frozenset[str] | None = None
+    linear_input_transforms: dict[str, GGUFLinearInputTransform] = field(
+        default_factory=dict
+    )
 
 
 class BaseGGUFWeightsAdapter(ABC):
@@ -90,13 +94,29 @@ class BaseGGUFWeightsAdapter(ABC):
             name_map,
             selected_tensors,
         )
+        linear_input_transforms = self.get_linear_input_transforms(
+            files,
+            model_config,
+            name_map,
+        )
 
         return GGUFLoadPlan(
             files=files,
             name_map=name_map,
             unquantized_modules=unquantized_modules,
             selected_tensors=selected_tensors,
+            linear_input_transforms=linear_input_transforms,
         )
+
+    def get_linear_input_transforms(
+        self,
+        files: GGUFModelFiles,
+        model_config: ModelConfig,
+        name_map: dict[str, str],
+    ) -> dict[str, GGUFLinearInputTransform]:
+        """Describe input layouts required by GGUF linear weights."""
+        del files, model_config, name_map
+        return {}
 
     def get_unquantized_modules(
         self,
