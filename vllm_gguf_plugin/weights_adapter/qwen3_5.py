@@ -97,7 +97,7 @@ _MTP_NORM_SUFFIXES = (
 
 def _enable_gguf_embedding(layer, quant_config: GGUFConfig) -> None:
     """Give Qwen's unquantized-by-construction embedding packed GGUF params."""
-    # TODO: Remove this workaround after vLLM's Qwen3.5 model passes
+    # TODO(Isotr0py): Remove this workaround after vLLM's Qwen3.5 model passes
     # quant_config and prefix to VocabParallelEmbedding during construction.
     if isinstance(layer.quant_method, GGUFEmbeddingMethod):
         return
