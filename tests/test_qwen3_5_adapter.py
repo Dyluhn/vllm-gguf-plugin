@@ -13,7 +13,10 @@ from vllm.model_executor.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 
 import vllm_gguf_plugin.weights_adapter.qwen3_5 as qwen_module
 from vllm_gguf_plugin.gguf_files import GGUFModelFiles
@@ -21,14 +24,16 @@ from vllm_gguf_plugin.quantization.config import GGUFConfig
 from vllm_gguf_plugin.quantization.layout import GGUFHeadTilingLayout
 from vllm_gguf_plugin.quantization.linear import GGUFLinearMethod
 from vllm_gguf_plugin.quantization.params import GGUFUninitializedParameter
-from vllm_gguf_plugin.quantization.vocal_embeds import GGUFEmbeddingMethod
+from vllm_gguf_plugin.quantization.vocal_embeds import (
+    GGUFEmbeddingMethod,
+    recursive_replace_vocab_modules,
+)
 from vllm_gguf_plugin.weight_utils import split_stacked_experts
 from vllm_gguf_plugin.weights_adapter import (
     Qwen35GGUFAdapter,
     Qwen35MtpGGUFAdapter,
     get_weights_adapter,
 )
-from vllm_gguf_plugin.weights_adapter.base import GGUFLoadPlan
 from vllm_gguf_plugin.weights_adapter.qwen3_5 import (
     build_qwen35_mtp_mapper,
     build_qwen35_text_mapper,
@@ -310,7 +315,7 @@ def test_qwen_gdn_declares_out_proj_input_layout_before_model_init():
     assert prefixed_method.layout is layouts[module_name]
 
 
-def test_configure_model_enables_packed_token_embedding(monkeypatch):
+def test_recursive_replace_vocab_modules(monkeypatch):
     monkeypatch.setattr(vocab_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(vocab_module, "get_tensor_model_parallel_world_size", lambda: 1)
     embedding = VocabParallelEmbedding(
@@ -319,27 +324,25 @@ def test_configure_model_enables_packed_token_embedding(monkeypatch):
         org_num_embeddings=10,
         padding_size=8,
     )
+    lm_head = ParallelLMHead(
+        num_embeddings=10,
+        embedding_dim=4,
+        org_num_embeddings=10,
+        padding_size=8,
+    )
     model = nn.Module()
     model.embed_tokens = embedding
-    files = GGUFModelFiles(("model.gguf",))
-    plan = GGUFLoadPlan(
-        files=files,
-        name_map={"token_embd.weight": "model.embed_tokens.weight"},
-        unquantized_modules=(),
-    )
+    model.lm_head = lm_head
     quant_config = GGUFConfig()
 
-    Qwen35GGUFAdapter().configure_model(
-        model,
-        plan,
-        SimpleNamespace(hf_config=PretrainedConfig()),
-        quant_config,
-    )
+    recursive_replace_vocab_modules(model, quant_config)
 
-    assert embedding.weight is None
-    assert isinstance(embedding.quant_method, GGUFEmbeddingMethod)
-    assert isinstance(embedding.qweight, GGUFUninitializedParameter)
-    assert isinstance(embedding.qweight_type, GGUFUninitializedParameter)
+    assert model.embed_tokens is not embedding
+    assert model.lm_head is not lm_head
+    for module in (model.embed_tokens, model.lm_head):
+        assert isinstance(module.quant_method, GGUFEmbeddingMethod)
+        assert isinstance(module.qweight, GGUFUninitializedParameter)
+        assert isinstance(module.qweight_type, GGUFUninitializedParameter)
 
 
 def test_runtime_input_reorder_matches_logical_weight_reorder():

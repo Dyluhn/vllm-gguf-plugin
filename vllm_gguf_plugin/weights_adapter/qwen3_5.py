@@ -10,20 +10,15 @@ from typing import TYPE_CHECKING
 import gguf
 import torch
 from vllm.logger import init_logger
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-)
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
 from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeConfig
 
 from ..gguf_files import GGUFModelFiles
 from ..gguf_utils import maybe_patch_hf_config_from_gguf
-from ..quantization.config import GGUFConfig
 from ..quantization.layout import GGUFHeadTilingLayout, GGUFLinearLayout
-from ..quantization.vocal_embeds import GGUFEmbeddingMethod
 from ..weight_utils import get_gguf_tensor_names, split_stacked_experts
-from .base import BaseGGUFWeightsAdapter, GGUFLoadPlan, GGUFWeight
+from .base import BaseGGUFWeightsAdapter, GGUFWeight
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -90,27 +85,6 @@ _MTP_NORM_SUFFIXES = (
     "norm_embedding.weight",
     "norm_hidden.weight",
 )
-
-
-def _enable_gguf_embedding(layer, quant_config: GGUFConfig) -> None:
-    """Give Qwen's unquantized-by-construction embedding packed GGUF params."""
-    # TODO(Isotr0py): Remove this workaround after vLLM's Qwen3.5 model passes
-    # quant_config and prefix to VocabParallelEmbedding during construction.
-    if isinstance(layer.quant_method, GGUFEmbeddingMethod):
-        return
-
-    layer.register_parameter("weight", None)
-    quant_method = GGUFEmbeddingMethod(quant_config)
-    layer.quant_method = quant_method
-    quant_method.create_weights(
-        layer,
-        layer.embedding_dim,
-        [layer.num_embeddings_per_partition],
-        layer.embedding_dim,
-        layer.num_embeddings_padded,
-        params_dtype=layer.params_dtype,
-        weight_loader=layer.weight_loader,
-    )
 
 
 def _find_nextn_block_index_from_names(
@@ -303,31 +277,6 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
             for mapped_name in name_map.values()
             if mapped_name.endswith("linear_attn.out_proj.weight")
         }
-
-    def configure_model(
-        self,
-        model: torch.nn.Module,
-        plan: GGUFLoadPlan,
-        model_config: ModelConfig,
-        quant_config: GGUFConfig,
-    ) -> None:
-        embed_name = plan.name_map.get("token_embd.weight")
-        if embed_name is None:
-            return
-        embed_module = embed_name.removesuffix(".weight")
-        if embed_module in plan.unquantized_modules:
-            return
-
-        embeddings = [
-            module
-            for name, module in model.named_modules()
-            if name.endswith("embed_tokens") and type(module) is VocabParallelEmbedding
-        ]
-        if len(embeddings) != 1:
-            raise RuntimeError(
-                f"Expected exactly one Qwen3.5 token embedding, found {len(embeddings)}"
-            )
-        _enable_gguf_embedding(embeddings[0], quant_config)
 
     def _restore_gdn_weight(
         self,

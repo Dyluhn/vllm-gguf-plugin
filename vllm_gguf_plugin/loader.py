@@ -18,7 +18,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 
 from .gguf_files import GGUFModelFiles, resolve_gguf_model_files
 from .gguf_utils import get_remote_gguf_repo_id, resolve_explicit_mm_proj
-from .quantization import GGUFConfig
+from .quantization import GGUFConfig, recursive_replace_vocab_modules
 from .weight_utils import (
     download_gguf,
     download_mmproj,
@@ -138,11 +138,10 @@ class GGUFModelLoader(BaseModelLoader):
                     model_config=model_config,
                     prefix=prefix,
                 )
-                adapter.configure_model(
+                recursive_replace_vocab_modules(
                     model,
-                    plan,
-                    model_config,
                     vllm_config.quant_config,
+                    prefix=prefix,
                 )
             model.load_weights(
                 adapter.iter_weights(plan, model_config),

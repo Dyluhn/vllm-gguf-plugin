@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
     from vllm.config import ModelConfig
 
-    from ..quantization.config import GGUFConfig
     from ..quantization.layout import GGUFLinearLayout
 
 
@@ -160,16 +159,6 @@ class BaseGGUFWeightsAdapter(ABC):
             selected_tensors=plan.selected_tensors,
         )
         yield from self.transform_weights(weights, model_config)
-
-    def configure_model(
-        self,
-        model: torch.nn.Module,
-        plan: GGUFLoadPlan,
-        model_config: ModelConfig,
-        quant_config: GGUFConfig,
-    ) -> None:
-        """Apply model-specific adjustments after init and before loading."""
-        del model, plan, model_config, quant_config
 
     def transform_weights(
         self,
