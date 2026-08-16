@@ -242,13 +242,12 @@ class _GGUFParamLoadMixin:
         if tp_size > 1 and layout is not None:
             weight_type_param = self.gguf_weight_type_parameter
             weight_type = weight_type_param.weight_type
-            try:
-                block_size, _ = gguf.GGML_QUANT_SIZES[weight_type]
-            except KeyError as error:
+            if weight_type not in gguf.GGML_QUANT_SIZES:
                 raise ValueError(
                     f"Unknown GGUF weight type {weight_type} while sharding "
                     "a transformed row-parallel weight"
-                ) from error
+                )
+            block_size, _ = gguf.GGML_QUANT_SIZES[weight_type]
             loaded_weight = layout.shard_weight(
                 loaded_weight,
                 dim=self.input_dim,

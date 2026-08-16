@@ -9,14 +9,11 @@ and compares logprobs against AutoModelForImageTextToText.
 
 import gc
 import os
-from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
 import torch
 import torch.nn.functional as F
-from huggingface_hub import hf_hub_download
-from pytest import MarkDecorator
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from vllm import LLM, SamplingParams
 from vllm.assets.image import ImageAsset
@@ -26,34 +23,16 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 MAX_TOKENS = 32
 NUM_LOGPROBS = 10
+MAX_MODEL_LEN = 4096
 GPU_MEMORY_UTILIZATION = 0.8
 
 
 class GGUFMMTestConfig(NamedTuple):
     original_model: str
-    gguf_repo: str
-    gguf_backbone: str
-    gguf_mmproj: str
-    prompt: list[str]
+    gguf_model_path: str
+    prompts: list[str]
     image_names: list[str]
-    max_model_len: int = 4096
-    marks: list[MarkDecorator] = []
-    mm_processor_kwargs: dict[str, Any] = {}
-
-    @property
-    def gguf_model(self) -> str:
-        """Download backbone + mmproj; return local path to backbone."""
-        repo_path = Path(self.gguf_repo)
-        if repo_path.is_dir():
-            mmproj_path = repo_path / self.gguf_mmproj
-            backbone_path = repo_path / self.gguf_backbone
-            assert mmproj_path.is_file(), f"Missing GGUF mmproj file: {mmproj_path}"
-            assert backbone_path.is_file(), (
-                f"Missing GGUF backbone file: {backbone_path}"
-            )
-            return str(backbone_path)
-        hf_hub_download(self.gguf_repo, filename=self.gguf_mmproj)
-        return hf_hub_download(self.gguf_repo, filename=self.gguf_backbone)
+    mm_processor_kwargs: dict[str, Any] | None = None
 
 
 _GEMMA3_PROMPTS = [
@@ -72,25 +51,16 @@ _GEMMA3_IMAGE_NAMES = ["stop_sign", "cherry_blossom"]
 
 GEMMA3_CONFIG = GGUFMMTestConfig(
     original_model="google/gemma-3-4b-it",
-    gguf_repo="google/gemma-3-4b-it-qat-q4_0-gguf",
-    gguf_backbone="gemma-3-4b-it-q4_0.gguf",
-    gguf_mmproj="mmproj-model-f16-4B.gguf",
-    prompt=_GEMMA3_PROMPTS,
+    gguf_model_path="google/gemma-3-4b-it-qat-q4_0-gguf:Q4_0",
+    prompts=_GEMMA3_PROMPTS,
     image_names=_GEMMA3_IMAGE_NAMES,
-    max_model_len=4096,
-    marks=[pytest.mark.slow],
-    mm_processor_kwargs={},
 )
 
 GEMMA3_CONFIG_PAN_AND_SCAN = GGUFMMTestConfig(
     original_model="google/gemma-3-4b-it",
-    gguf_repo="google/gemma-3-4b-it-qat-q4_0-gguf",
-    gguf_backbone="gemma-3-4b-it-q4_0.gguf",
-    gguf_mmproj="mmproj-model-f16-4B.gguf",
-    prompt=_GEMMA3_PROMPTS,
+    gguf_model_path="google/gemma-3-4b-it-qat-q4_0-gguf:Q4_0",
+    prompts=_GEMMA3_PROMPTS,
     image_names=_GEMMA3_IMAGE_NAMES,
-    max_model_len=4096,
-    marks=[pytest.mark.slow],
     mm_processor_kwargs={"do_pan_and_scan": True},
 )
 
@@ -112,27 +82,26 @@ _QWEN35_IMAGE_NAMES = ["stop_sign", "cherry_blossom"]
 
 QWEN35_CONFIG = GGUFMMTestConfig(
     original_model="Qwen/Qwen3.5-0.8B",
-    gguf_repo="unsloth/Qwen3.5-0.8B-GGUF",
-    gguf_backbone="Qwen3.5-0.8B-Q4_K_M.gguf",
-    gguf_mmproj="mmproj-BF16.gguf",
-    prompt=_QWEN35_PROMPTS,
+    gguf_model_path="unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M",
+    prompts=_QWEN35_PROMPTS,
     image_names=_QWEN35_IMAGE_NAMES,
-    max_model_len=4096,
 )
 
 QWEN35_MOE_CONFIG = GGUFMMTestConfig(
     original_model="Qwen/Qwen3.5-35B-A3B",
-    gguf_repo="unsloth/Qwen3.5-35B-A3B-GGUF",
-    gguf_backbone="Qwen3.5-35B-A3B-Q4_K_M.gguf",
-    gguf_mmproj="mmproj-BF16.gguf",
-    prompt=_QWEN35_PROMPTS,
+    gguf_model_path="unsloth/Qwen3.5-35B-A3B-GGUF:Q4_K_M",
+    prompts=_QWEN35_PROMPTS,
     image_names=_QWEN35_IMAGE_NAMES,
-    max_model_len=4096,
-    marks=[pytest.mark.slow],
 )
 
-GEMMA3_MODELS_TO_TEST = [GEMMA3_CONFIG, GEMMA3_CONFIG_PAN_AND_SCAN]
-QWEN35_MODELS_TO_TEST = [QWEN35_CONFIG, QWEN35_MOE_CONFIG]
+GEMMA3_MODELS_TO_TEST = [
+    pytest.param(GEMMA3_CONFIG, marks=pytest.mark.slow),
+    pytest.param(GEMMA3_CONFIG_PAN_AND_SCAN, marks=pytest.mark.slow),
+]
+QWEN35_MODELS_TO_TEST = [
+    QWEN35_CONFIG,
+    pytest.param(QWEN35_MOE_CONFIG, marks=pytest.mark.slow),
+]
 
 
 def _vllm_generate_greedy_logprobs(
@@ -143,8 +112,7 @@ def _vllm_generate_greedy_logprobs(
     max_tokens: int,
     num_logprobs: int,
     dtype: str,
-    max_model_len: int,
-    mm_processor_kwargs: dict[str, Any],
+    mm_processor_kwargs: dict[str, Any] | None,
 ) -> list[tuple[list[int], str, list[dict[int, float] | None]]]:
     """Run inference via vllm.LLM and return (token_ids, text, logprobs)."""
     llm = LLM(
@@ -153,8 +121,8 @@ def _vllm_generate_greedy_logprobs(
         enforce_eager=True,
         dtype=dtype,
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-        max_model_len=max_model_len,
-        mm_processor_kwargs=mm_processor_kwargs or None,
+        max_model_len=MAX_MODEL_LEN,
+        mm_processor_kwargs=mm_processor_kwargs,
     )
     try:
         sampling_params = SamplingParams(
@@ -305,20 +273,19 @@ def run_multimodal_gguf_test(
             [prompt for _ in size_factors],
             [rescale_image_size(image, factor) for factor in size_factors],
         )
-        for image, prompt in zip(images, model.prompt)
+        for image, prompt in zip(images, model.prompts)
     ]
 
     # Run vLLM GGUF first to keep CUDA context clean before loading HF model.
     gguf_outputs_per_case = [
         _vllm_generate_greedy_logprobs(
-            model_path=model.gguf_model,
+            model_path=model.gguf_model_path,
             tokenizer_name=model.original_model,
             prompts=prompts,
             images=scaled_images,
             max_tokens=max_tokens,
             num_logprobs=num_logprobs,
             dtype=dtype,
-            max_model_len=model.max_model_len,
             mm_processor_kwargs=model.mm_processor_kwargs,
         )
         for prompts, scaled_images in inputs_per_image
@@ -351,10 +318,7 @@ def run_multimodal_gguf_test(
 )
 @pytest.mark.parametrize(
     "model",
-    [
-        pytest.param(test_config, marks=test_config.marks)
-        for test_config in GEMMA3_MODELS_TO_TEST
-    ],
+    GEMMA3_MODELS_TO_TEST,
 )
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 @pytest.mark.parametrize("max_tokens", [MAX_TOKENS])
@@ -374,10 +338,7 @@ def test_gemma3_mm_gguf(
 )
 @pytest.mark.parametrize(
     "model",
-    [
-        pytest.param(test_config, marks=test_config.marks)
-        for test_config in QWEN35_MODELS_TO_TEST
-    ],
+    QWEN35_MODELS_TO_TEST,
 )
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 @pytest.mark.parametrize("max_tokens", [MAX_TOKENS])
