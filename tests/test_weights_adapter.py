@@ -13,6 +13,7 @@ from transformers import PretrainedConfig
 import vllm_gguf_plugin.weight_utils as weight_utils_module
 import vllm_gguf_plugin.weights_adapter.base as base_module
 import vllm_gguf_plugin.weights_adapter.gemma3 as gemma3_module
+import vllm_gguf_plugin.weights_adapter.olmoe as olmoe_module
 from vllm_gguf_plugin.gguf_files import (
     GGUFModelFiles,
     resolve_gguf_model_files,
@@ -24,6 +25,7 @@ from vllm_gguf_plugin.weight_utils import (
 from vllm_gguf_plugin.weights_adapter import (
     BaseGGUFWeightsAdapter,
     Gemma3GGUFAdapter,
+    OLMoEGGUFAdapter,
     TransformersGGUFWeightsAdapter,
     get_weights_adapter,
 )
@@ -221,10 +223,69 @@ def test_gemma3_name_map_covers_backbone_and_mmproj(monkeypatch):
     )
 
 
+def test_olmoe_name_map_uses_manual_mapper(monkeypatch):
+    monkeypatch.setattr(
+        olmoe_module,
+        "get_gguf_tensor_names",
+        lambda files: {
+            "token_embd.weight",
+            "blk.0.attn_q.weight",
+            "blk.0.ffn_gate_exps.weight",
+            "blk.0.ffn_up_exps.weight",
+            "blk.0.ffn_down_exps.weight",
+        },
+    )
+    files = GGUFModelFiles(("model.gguf",))
+
+    name_map = OLMoEGGUFAdapter().build_name_map(files, SimpleNamespace())
+
+    assert name_map["token_embd.weight"] == "model.embed_tokens.weight"
+    assert name_map["blk.0.attn_q.weight"] == ("model.layers.0.self_attn.q_proj.weight")
+    assert name_map["blk.0.ffn_gate_exps.weight"] == (
+        "model.layers.0.mlp.experts.0.gate_proj.weight"
+    )
+    assert name_map["blk.0.ffn_up_exps.weight"] == (
+        "model.layers.0.mlp.experts.0.up_proj.weight"
+    )
+    assert name_map["blk.0.ffn_down_exps.weight"] == (
+        "model.layers.0.mlp.experts.0.down_proj.weight"
+    )
+
+
+def test_olmoe_transform_splits_expert_dimension():
+    gate = torch.arange(24).reshape(2, 3, 4)
+    qweight_type = torch.tensor(2)
+    weights = list(
+        OLMoEGGUFAdapter().transform_weights(
+            [
+                ("model.layers.0.mlp.experts.0.gate_proj.qweight", gate),
+                (
+                    "model.layers.0.mlp.experts.0.gate_proj.qweight_type",
+                    qweight_type,
+                ),
+            ],
+            SimpleNamespace(),
+        )
+    )
+
+    assert [name for name, _ in weights] == [
+        "model.layers.0.mlp.experts.0.gate_proj.qweight",
+        "model.layers.0.mlp.experts.1.gate_proj.qweight",
+        "model.layers.0.mlp.experts.0.gate_proj.qweight_type",
+    ]
+    assert torch.equal(weights[0][1], gate[0])
+    assert torch.equal(weights[1][1], gate[1])
+    assert weights[2][1] is qweight_type
+
+
 def test_adapter_factory_uses_specialized_adapter_before_fallback():
     assert isinstance(
         get_weights_adapter(PretrainedConfig(model_type="gemma3_text")),
         Gemma3GGUFAdapter,
+    )
+    assert isinstance(
+        get_weights_adapter(PretrainedConfig(model_type="olmoe")),
+        OLMoEGGUFAdapter,
     )
     assert isinstance(
         get_weights_adapter(PretrainedConfig(model_type="llama")),

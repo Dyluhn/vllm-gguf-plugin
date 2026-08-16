@@ -11,10 +11,12 @@ from .diffusion import (
     get_diffusion_gguf_adapter,
 )
 from .gemma3 import Gemma3GGUFAdapter
+from .olmoe import OLMoEGGUFAdapter
 from .transformers import TransformersGGUFWeightsAdapter
 
 _ADAPTER_REGISTRY: list[type[BaseGGUFWeightsAdapter]] = [
     Gemma3GGUFAdapter,
+    OLMoEGGUFAdapter,
 ]
 
 
@@ -33,6 +35,7 @@ __all__ = [
     "GGUFLoadPlan",
     "GGUFModelFiles",
     "Gemma3GGUFAdapter",
+    "OLMoEGGUFAdapter",
     "QwenImageDiffusionGGUFAdapter",
     "TransformersGGUFWeightsAdapter",
     "ZImageDiffusionGGUFAdapter",
