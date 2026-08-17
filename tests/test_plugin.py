@@ -61,6 +61,14 @@ def test_register_is_idempotent():
     assert isinstance(get_config_parser("gguf"), GGUFConfigParser)
 
 
+def test_register_preserves_gguf_reference_during_offline_resolution():
+    register()
+
+    model = "org/model:Q4_0"
+
+    assert arg_utils_module.get_model_path(model, revision=None) == model
+
+
 def test_oot_config_reuses_in_tree_behavior():
     quant_config = OOTGGUFConfig.from_config({})
 

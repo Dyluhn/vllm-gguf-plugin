@@ -48,6 +48,23 @@ def _get_gguf_config_source(
     return model
 
 
+def _patch_offline_model_path() -> None:
+    """Keep GGUF references intact until their config source is resolved."""
+    if getattr(arg_utils_module, "_gguf_get_model_path_patched", False):
+        return
+
+    original_get_model_path = arg_utils_module.get_model_path
+
+    @wraps(original_get_model_path)
+    def get_model_path(model: str, revision: str | None = None) -> str:
+        if _is_gguf_reference(model):
+            return model
+        return original_get_model_path(model, revision)
+
+    arg_utils_module.get_model_path = get_model_path
+    arg_utils_module._gguf_get_model_path_patched = True
+
+
 def _patch_engine_args() -> None:
     if getattr(EngineArgs, "_gguf_create_model_config_patched", False):
         return
@@ -122,6 +139,7 @@ def register() -> None:
         parser = None
     if not isinstance(parser, GGUFConfigParser):
         register_config_parser("gguf")(GGUFConfigParser)
+    _patch_offline_model_path()
     _patch_engine_args()
     _patch_speculator_probe()
     _patch_diffusers_loader()
