@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from typing import cast
+from typing import NamedTuple, cast
 
 import torch
 import torch.nn as nn
@@ -22,11 +22,20 @@ from .quantization import GGUFConfig
 from .weight_utils import (
     download_gguf,
     download_mmproj,
+    get_gguf_tensor_names,
+    get_gguf_unquantized_params,
+    gguf_quant_weights_iterator_multi,
     resolve_local_gguf,
 )
-from .weights_adapter import get_weights_adapter
+from .weights_adapter import BaseGGUFWeightsAdapter, get_weights_adapter
 
 logger = init_logger(__name__)
+
+
+class GGUFLoadPlan(NamedTuple):
+    files: GGUFModelFiles
+    name_map: dict[str, str]
+    unquantized_modules: tuple[str, ...]
 
 
 def _revision_for_weights_repo(
@@ -44,6 +53,20 @@ def _revision_for_weights_repo(
     if isinstance(revision, ResolvedRevision) and weights_repo_id != model_config.model:
         return revision.initial
     return revision
+
+
+def _get_unquantized_modules(
+    files: GGUFModelFiles,
+    name_map: dict[str, str],
+) -> tuple[str, ...]:
+    unquantized_tensors = get_gguf_unquantized_params(list(files.all_files))
+    modules = {
+        mapped_name.removesuffix(".weight")
+        for gguf_name in unquantized_tensors
+        if (mapped_name := name_map.get(gguf_name)) is not None
+        and mapped_name.endswith(".weight")
+    }
+    return tuple(sorted(modules))
 
 
 class GGUFModelLoader(BaseModelLoader):
@@ -121,18 +144,44 @@ class GGUFModelLoader(BaseModelLoader):
 
         return files
 
-    def _prepare_adapter(self, model_config: ModelConfig):
+    def _prepare_adapter(
+        self, model_config: ModelConfig
+    ) -> tuple[BaseGGUFWeightsAdapter, GGUFLoadPlan]:
         files = self._prepare_model_files(model_config)
         adapter = get_weights_adapter(model_config.hf_config)
-        plan = adapter.prepare(files, model_config)
-        return adapter, plan
+        model_config.hf_config = adapter.patch_hf_config(
+            files,
+            model_config.hf_config,
+        )
+
+        text_config = model_config.hf_config.get_text_config()
+        backbone_names = get_gguf_tensor_names(files.backbone)
+        text_config.update(
+            {"tie_word_embeddings": "output.weight" not in backbone_names}
+        )
+
+        name_map = adapter.build_name_map(files, model_config)
+        unquantized_modules = _get_unquantized_modules(files, name_map)
+        return adapter, GGUFLoadPlan(files, name_map, unquantized_modules)
+
+    def _iter_weights(
+        self,
+        adapter: BaseGGUFWeightsAdapter,
+        plan: GGUFLoadPlan,
+        model_config: ModelConfig,
+    ):
+        weights = gguf_quant_weights_iterator_multi(
+            list(plan.files.all_files),
+            plan.name_map,
+        )
+        return adapter.transform_weights(weights, model_config)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_model_files(model_config)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         adapter, plan = self._prepare_adapter(model_config)
-        model.load_weights(adapter.iter_weights(plan, model_config))
+        model.load_weights(self._iter_weights(adapter, plan, model_config))
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
@@ -149,7 +198,7 @@ class GGUFModelLoader(BaseModelLoader):
             with target_device:
                 model = initialize_model(vllm_config=vllm_config, prefix=prefix)
             model.load_weights(
-                adapter.iter_weights(plan, model_config),
+                self._iter_weights(adapter, plan, model_config),
             )
             process_weights_after_loading(model, model_config, target_device)
         return model
