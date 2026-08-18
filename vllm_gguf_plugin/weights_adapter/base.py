@@ -4,28 +4,23 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
+
+from ..gguf_files import GGUFModelFiles
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
     from vllm.config import ModelConfig
 
 
-@dataclass(slots=True)
-class GGUFLoadSpec:
-    weights_source: list[str]
-    unquantized_modules: list[str]
-    gguf_to_hf_name_map: dict[str, str] | None = None
+GGUFWeight = tuple[str, torch.Tensor]
 
 
 class BaseGGUFWeightsAdapter(ABC):
-    """Base hooks for GGUF weight loading adapters."""
-
-    def __init__(self, config: PretrainedConfig) -> None:
-        self.config = config
+    """Model-specific GGUF name mapping and tensor transformation hooks."""
 
     @classmethod
     @abstractmethod
@@ -33,27 +28,27 @@ class BaseGGUFWeightsAdapter(ABC):
         """Return whether this adapter supports *config*."""
 
     @abstractmethod
-    def prepare_weights(self, model_config: ModelConfig) -> None:
-        """Return HF-style weights."""
-
-    @abstractmethod
-    def prepare_loading(self, model_config: ModelConfig) -> None:
-        """Preparation before loading, e.g., patching the HF config."""
+    def build_name_map(
+        self,
+        files: GGUFModelFiles,
+        model_config: ModelConfig,
+    ) -> dict[str, str]:
+        """Map raw GGUF tensor names to names accepted by the model."""
 
     def patch_hf_config(
         self,
-        model_path: str,
+        files: GGUFModelFiles,
         hf_config: PretrainedConfig,
     ) -> PretrainedConfig:
         """Patch HF config before model init."""
-        del model_path
+        del files
         return hf_config
 
-    def transform_weight(
+    def transform_weights(
         self,
-        hf_name: str,
-        weight: torch.Tensor,
-    ) -> torch.Tensor:
-        """Transform one loaded weight."""
-        del hf_name
-        return weight
+        weights: Iterable[GGUFWeight],
+        model_config: ModelConfig,
+    ) -> Iterable[GGUFWeight]:
+        """Apply model-specific transformations to mapped weights."""
+        del model_config
+        yield from weights

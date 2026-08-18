@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
-import os
-import re
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
-import torch
 from vllm.model_executor.models.utils import WeightsMapper
 
+from ..gguf_files import GGUFModelFiles
 from ..gguf_utils import maybe_patch_hf_config_from_gguf
-from ..weight_utils import (
-    get_gguf_unquantized_params,
-    gguf_quant_weights_iterator_multi,
-)
-from .base import BaseGGUFWeightsAdapter, GGUFLoadSpec
+from ..weight_utils import get_gguf_tensor_names
+from .base import BaseGGUFWeightsAdapter, GGUFWeight
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -48,8 +43,8 @@ def build_olmoe_mapper() -> WeightsMapper:
 
 
 def split_olmoe_expert_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-) -> Iterable[tuple[str, torch.Tensor]]:
+    weights: Iterable[GGUFWeight],
+) -> Iterable[GGUFWeight]:
     for name, weight in weights:
         if weight.ndim == 3 and ".experts.0." in name:
             for expert_id, expert_weight in enumerate(weight.unbind()):
@@ -67,65 +62,32 @@ def split_olmoe_expert_weights(
 class OLMoEGGUFAdapter(BaseGGUFWeightsAdapter):
     """Adapter for OLMoE GGUF models."""
 
-    mapper = None
-    load_spec = None
-
     @classmethod
     def matches(cls, config) -> bool:
         return config.model_type == "olmoe"
 
-    def patch_hf_config(self, model_path: str, hf_config: PretrainedConfig):
-        return maybe_patch_hf_config_from_gguf(model_path, hf_config)
-
-    @staticmethod
-    def _get_all_gguf_files(model_path: str) -> list[str]:
-        match = re.search(r"-(\d+)-of-(\d+)\.gguf$", model_path)
-        if not match:
-            return [model_path]
-
-        total = int(match.group(2))
-        num_digits = len(match.group(1))
-        prefix = model_path[: match.start(1)]
-        suffix = model_path[match.end(2) :]
-        files = []
-        for index in range(1, total + 1):
-            shard_path = (
-                f"{prefix}{index:0{num_digits}d}-of-{total:0{num_digits}d}{suffix}"
-            )
-            if os.path.isfile(shard_path):
-                files.append(shard_path)
-        return files or [model_path]
-
-    def prepare_loading(
+    def patch_hf_config(
         self,
-        model_path: str,
-        model_config: ModelConfig,
-    ) -> GGUFLoadSpec:
-        model_config.hf_config = self.patch_hf_config(
-            model_path,
-            model_config.hf_config,
-        )
-        gguf_files = self._get_all_gguf_files(model_path)
-        self.mapper = build_olmoe_mapper()
-        unquantized_params = get_gguf_unquantized_params(gguf_files)
-        unquantized_modules = list(
-            {
-                param.rsplit(".", 1)[0] if param.endswith(".weight") else param
-                for param in self.mapper.apply_list(unquantized_params)
-            }
-        )
-        self.load_spec = GGUFLoadSpec(
-            weights_source=gguf_files,
-            unquantized_modules=unquantized_modules,
-        )
-        return self.load_spec
+        files: GGUFModelFiles,
+        hf_config: PretrainedConfig,
+    ):
+        return maybe_patch_hf_config_from_gguf(files.primary_backbone, hf_config)
 
-    def prepare_weights(
+    def build_name_map(
         self,
+        files: GGUFModelFiles,
         model_config: ModelConfig,
-    ) -> Iterable[tuple[str, torch.Tensor]]:
+    ) -> dict[str, str]:
         del model_config
-        if self.mapper is None or self.load_spec is None:
-            raise RuntimeError("prepare_loading must be called before prepare_weights")
-        orig_weights = gguf_quant_weights_iterator_multi(self.load_spec.weights_source)
-        yield from split_olmoe_expert_weights(self.mapper.apply(orig_weights))
+        mapper = build_olmoe_mapper()
+        gguf_names = sorted(get_gguf_tensor_names(files.backbone))
+        hf_names = mapper.apply_list(gguf_names)
+        return dict(zip(gguf_names, hf_names, strict=True))
+
+    def transform_weights(
+        self,
+        weights: Iterable[GGUFWeight],
+        model_config: ModelConfig,
+    ) -> Iterable[GGUFWeight]:
+        del model_config
+        yield from split_olmoe_expert_weights(weights)
