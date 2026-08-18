@@ -13,10 +13,7 @@ from transformers import PretrainedConfig
 import vllm_gguf_plugin.weight_utils as weight_utils_module
 import vllm_gguf_plugin.weights_adapter.base as base_module
 import vllm_gguf_plugin.weights_adapter.gemma3 as gemma3_module
-from vllm_gguf_plugin.gguf_files import (
-    GGUFModelFiles,
-    resolve_gguf_model_files,
-)
+from vllm_gguf_plugin.gguf_files import GGUFModelFiles
 from vllm_gguf_plugin.weight_utils import (
     get_gguf_shard_files,
     gguf_quant_weights_iterator_multi,
@@ -56,20 +53,6 @@ class _TestAdapter(BaseGGUFWeightsAdapter):
         del model_config
         for name, weight in weights:
             yield f"transformed.{name}", weight
-
-
-def test_resolve_gguf_model_files_groups_shards_and_mmproj(tmp_path):
-    first = tmp_path / "model-00001-of-00002.gguf"
-    second = tmp_path / "model-00002-of-00002.gguf"
-    mm_proj = tmp_path / "mmproj.gguf"
-    for path in (first, second, mm_proj):
-        path.write_bytes(b"GGUF")
-
-    files = resolve_gguf_model_files(str(first))
-
-    assert files.backbone == (str(first), str(second))
-    assert files.mm_proj == str(mm_proj)
-    assert files.all_files == (str(first), str(second), str(mm_proj))
 
 
 def test_get_gguf_shard_files_rejects_incomplete_set(tmp_path):

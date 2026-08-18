@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from huggingface_hub import ResolvedRevision
 from vllm.config.load import LoadConfig
 
 import vllm_gguf_plugin.loader as loader_module
@@ -178,6 +179,51 @@ class TestGGUFModelLoader:
         assert result == f"{mock_folder}/model-IQ1_S.gguf"
         mock_download.assert_called_once()
 
+    @pytest.mark.parametrize(
+        ("initial_revision", "resolved_revision", "expected_revision"),
+        [
+            (None, "b" * 40, None),
+            ("weights-branch", "b" * 40, "weights-branch"),
+            ("a" * 40, "a" * 40, "a" * 40),
+        ],
+    )
+    @patch("vllm_gguf_plugin.loader.download_gguf")
+    @patch("os.path.isdir", return_value=False)
+    @patch("os.path.isfile", return_value=False)
+    def test_prepare_weights_detaches_revision_resolved_for_another_repo(
+        self,
+        mock_isfile,
+        mock_isdir,
+        mock_download,
+        initial_revision,
+        resolved_revision,
+        expected_revision,
+    ):
+        mock_download.return_value = "/downloaded/model-Q4_0.gguf"
+        load_config = LoadConfig(load_format="gguf")
+        loader = GGUFModelLoader(load_config)
+
+        model_config = MagicMock()
+        model_config.model = "org/config-repo"
+        model_config.model_weights = "org/weights-repo:Q4_0"
+        model_config.revision = ResolvedRevision(
+            initial=initial_revision,
+            resolved=resolved_revision,
+        )
+
+        result = loader._prepare_weights(model_config)
+
+        assert result == "/downloaded/model-Q4_0.gguf"
+        mock_download.assert_called_once_with(
+            "org/weights-repo",
+            "Q4_0",
+            cache_dir=None,
+            revision=expected_revision,
+            ignore_patterns=load_config.ignore_patterns,
+        )
+        revision = mock_download.call_args.kwargs["revision"]
+        assert revision is None or type(revision) is str
+
     @patch("os.path.isfile", return_value=False)
     def test_prepare_weights_invalid_format(self, mock_isfile):
         """Test _prepare_weights with invalid format."""
@@ -231,27 +277,11 @@ class TestGGUFModelLoader:
             revision="main",
             hf_config=SimpleNamespace(vision_config=object()),
         )
-        plain_files = GGUFModelFiles(("/cache/model-Q4_0.gguf",))
-        multimodal_files = GGUFModelFiles(
-            ("/cache/model-Q4_0.gguf",),
-            "/cache/mmproj-BF16.gguf",
-        )
-        resolve_calls = []
 
         monkeypatch.setattr(
             loader,
             "_prepare_weights",
             lambda config: "/cache/model-Q4_0.gguf",
-        )
-
-        def fake_resolve(model_path, mm_proj_path=None):
-            resolve_calls.append((model_path, mm_proj_path))
-            return multimodal_files if mm_proj_path is not None else plain_files
-
-        monkeypatch.setattr(
-            loader_module,
-            "resolve_gguf_model_files",
-            fake_resolve,
         )
         download_calls = []
 
@@ -263,9 +293,7 @@ class TestGGUFModelLoader:
 
         files = loader._prepare_model_files(model_config)
 
-        assert files is multimodal_files
+        assert files == GGUFModelFiles(
+            ("/cache/model-Q4_0.gguf",), "/cache/mmproj-BF16.gguf"
+        )
         assert download_calls == [("org/model", None, "main")]
-        assert resolve_calls == [
-            ("/cache/model-Q4_0.gguf", None),
-            ("/cache/model-Q4_0.gguf", "/cache/mmproj-BF16.gguf"),
-        ]
