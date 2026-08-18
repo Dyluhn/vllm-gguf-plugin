@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gguf
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 from vllm.distributed import (
@@ -41,6 +42,10 @@ def _resolve_gguf_weight_type_loader(
     def _gguf_weight_type_loader_v2(param, loaded_weight, loaded_shard_id=None):
         if loaded_shard_id is None and hasattr(param, "_store"):
             param._store(loaded_weight)
+            return
+        if isinstance(loaded_shard_id, tuple) and hasattr(param, "_store"):
+            for shard_id in loaded_shard_id:
+                param._store(loaded_weight, shard_id=shard_id)
             return
         base_loader(param, loaded_weight, loaded_shard_id)
 
@@ -233,7 +238,25 @@ class _GGUFParamLoadMixin:
     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
-        if tp_size > 1 and loaded_weight.ndim >= 2:
+        layout = getattr(self, "gguf_layout", None)
+        if tp_size > 1 and layout is not None:
+            weight_type_param = self.gguf_weight_type_parameter
+            weight_type = weight_type_param.weight_type
+            if weight_type not in gguf.GGML_QUANT_SIZES:
+                raise ValueError(
+                    f"Unknown GGUF weight type {weight_type} while sharding "
+                    "a transformed row-parallel weight"
+                )
+            block_size, _ = gguf.GGML_QUANT_SIZES[weight_type]
+            loaded_weight = layout.shard_weight(
+                loaded_weight,
+                dim=self.input_dim,
+                logical_size=self.gguf_logical_input_size,
+                block_size=block_size,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
+        elif tp_size > 1 and loaded_weight.ndim >= 2:
             shard_size = loaded_weight.shape[1] // tp_size
             if shard_size > 0:
                 loaded_weight = loaded_weight.narrow(

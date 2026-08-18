@@ -64,9 +64,43 @@ GEMMA3_CONFIG_PAN_AND_SCAN = GGUFMMTestConfig(
     mm_processor_kwargs={"do_pan_and_scan": True},
 )
 
+_QWEN35_PROMPTS = [
+    (
+        "<|im_start|>user\n"
+        "<|vision_start|><|image_pad|><|vision_end|>"
+        "What's the content in the center of the image?"
+        "<|im_end|>\n<|im_start|>assistant\n"
+    ),
+    (
+        "<|im_start|>user\n"
+        "<|vision_start|><|image_pad|><|vision_end|>"
+        "What is the season?"
+        "<|im_end|>\n<|im_start|>assistant\n"
+    ),
+]
+_QWEN35_IMAGE_NAMES = ["stop_sign", "cherry_blossom"]
+
+QWEN35_CONFIG = GGUFMMTestConfig(
+    original_model="Qwen/Qwen3.5-0.8B",
+    gguf_model_path="unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M",
+    prompts=_QWEN35_PROMPTS,
+    image_names=_QWEN35_IMAGE_NAMES,
+)
+
+QWEN35_MOE_CONFIG = GGUFMMTestConfig(
+    original_model="Qwen/Qwen3.5-35B-A3B",
+    gguf_model_path="unsloth/Qwen3.5-35B-A3B-GGUF:Q4_K_M",
+    prompts=_QWEN35_PROMPTS,
+    image_names=_QWEN35_IMAGE_NAMES,
+)
+
 GEMMA3_MODELS_TO_TEST = [
     pytest.param(GEMMA3_CONFIG, marks=pytest.mark.slow),
     pytest.param(GEMMA3_CONFIG_PAN_AND_SCAN, marks=pytest.mark.slow),
+]
+QWEN35_MODELS_TO_TEST = [
+    QWEN35_CONFIG,
+    pytest.param(QWEN35_MOE_CONFIG, marks=pytest.mark.slow),
 ]
 
 
@@ -290,6 +324,26 @@ def run_multimodal_gguf_test(
 @pytest.mark.parametrize("max_tokens", [MAX_TOKENS])
 @pytest.mark.parametrize("num_logprobs", [NUM_LOGPROBS])
 def test_gemma3_mm_gguf(
+    model: GGUFMMTestConfig,
+    dtype: str,
+    max_tokens: int,
+    num_logprobs: int,
+) -> None:
+    run_multimodal_gguf_test(model, dtype, max_tokens, num_logprobs)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA required for multimodal GGUF tests.",
+)
+@pytest.mark.parametrize(
+    "model",
+    QWEN35_MODELS_TO_TEST,
+)
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+@pytest.mark.parametrize("max_tokens", [MAX_TOKENS])
+@pytest.mark.parametrize("num_logprobs", [NUM_LOGPROBS])
+def test_qwen35_mm_gguf(
     model: GGUFMMTestConfig,
     dtype: str,
     max_tokens: int,

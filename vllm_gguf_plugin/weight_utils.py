@@ -187,6 +187,19 @@ def gguf_quant_weights_iterator_multi(
             yield name, param
 
 
+def split_stacked_experts(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Split stacked GGUF expert tensors into vLLM per-expert weights."""
+    for name, weight in weights:
+        if weight.ndim == 3 and ".experts.0." in name:
+            for expert_id, expert_weight in enumerate(weight.unbind()):
+                expert_name = name.replace(".experts.0.", f".experts.{expert_id}.")
+                yield expert_name, expert_weight
+        else:
+            yield name, weight
+
+
 def get_gguf_unquantized_params(gguf_files: list[str]) -> list[str]:
     _QUANT_TYPES = ("F32", "BF16", "F16")
     return list(

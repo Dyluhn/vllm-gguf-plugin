@@ -78,6 +78,27 @@ def _patch_engine_args() -> None:
     EngineArgs.create_model_config = create_model_config
     EngineArgs._gguf_create_model_config_patched = True
 
+    original_create_speculative_config = EngineArgs.create_speculative_config
+
+    @wraps(original_create_speculative_config)
+    def create_speculative_config(self, *args, **kwargs):
+        configured_model = getattr(self, "spec_model", None)
+        if self.speculative_config is not None:
+            configured_model = configured_model or self.speculative_config.get("model")
+
+        config = original_create_speculative_config(self, *args, **kwargs)
+        gguf_model = self.model_weights
+        if (
+            config is not None
+            and config.method == "mtp"
+            and configured_model is None
+            and _is_gguf_reference(gguf_model)
+        ):
+            config.draft_model_config.model_weights = gguf_model
+        return config
+
+    EngineArgs.create_speculative_config = create_speculative_config
+
 
 def _patch_speculator_probe() -> None:
     if getattr(arg_utils_module, "_gguf_speculator_probe_patched", False):

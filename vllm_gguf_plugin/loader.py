@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
+
 import os
-from typing import NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 import torch
 import torch.nn as nn
@@ -22,7 +24,7 @@ from .gguf_utils import (
     get_remote_gguf_repo_id,
     resolve_explicit_mm_proj,
 )
-from .quantization import GGUFConfig
+from .quantization import GGUFConfig, recursive_replace_vocab_modules
 from .weight_utils import (
     download_gguf,
     download_mmproj,
@@ -34,6 +36,9 @@ from .weight_utils import (
 )
 from .weights_adapter import BaseGGUFWeightsAdapter, get_weights_adapter
 
+if TYPE_CHECKING:
+    from .quantization.layout import GGUFLinearLayout
+
 logger = init_logger(__name__)
 
 
@@ -41,6 +46,7 @@ class GGUFLoadPlan(NamedTuple):
     files: GGUFModelFiles
     name_map: dict[str, str]
     unquantized_modules: tuple[str, ...]
+    linear_layouts: dict[str, GGUFLinearLayout]
 
 
 def _revision_for_weights_repo(
@@ -167,8 +173,13 @@ class GGUFModelLoader(BaseModelLoader):
         )
 
         name_map = adapter.build_name_map(files, model_config)
-        unquantized_modules = _get_unquantized_modules(files, name_map)
-        return adapter, GGUFLoadPlan(files, name_map, unquantized_modules)
+        unquantized_modules = _get_unquantized_modules(files, name_map) + tuple(
+            adapter.extra_unquantized_modules
+        )
+        linear_layouts = adapter.get_linear_layouts(files, model_config, name_map)
+        return adapter, GGUFLoadPlan(
+            files, name_map, unquantized_modules, linear_layouts
+        )
 
     def _iter_weights(
         self,
@@ -194,15 +205,27 @@ class GGUFModelLoader(BaseModelLoader):
     ) -> nn.Module:
         device_config = vllm_config.device_config
         adapter, plan = self._prepare_adapter(model_config)
-        vllm_config.model_config.hf_config = model_config.hf_config
         logger.debug("GGUF unquantized modules: %s", plan.unquantized_modules)
         vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
         vllm_config.quant_config.unquantized_modules.extend(plan.unquantized_modules)
+        vllm_config.quant_config.register_linear_layouts(
+            plan.linear_layouts,
+            prefix=prefix,
+        )
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                model = initialize_model(vllm_config=vllm_config, prefix=prefix)
+                model = initialize_model(
+                    vllm_config=vllm_config,
+                    model_config=model_config,
+                    prefix=prefix,
+                )
+                recursive_replace_vocab_modules(
+                    model,
+                    vllm_config.quant_config,
+                    prefix=prefix,
+                )
             model.load_weights(
                 self._iter_weights(adapter, plan, model_config),
             )

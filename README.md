@@ -61,6 +61,18 @@ The same hooks also run in GitHub Actions on every push and pull request.
 vllm serve Qwen/Qwen3-0.6B-GGUF:Q8_0 --tokenizer Qwen/Qwen3-0.6B
 ```
 
+Qwen 3.5 MTP speculative decoding loads the `nextn` block embedded in the same
+GGUF; it does not download separate Hugging Face MTP weights:
+
+```bash
+vllm serve unsloth/Qwen3.5-4B-MTP-GGUF:Q4_K_M \
+  --tokenizer Qwen/Qwen3.5-4B \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
+```
+
+For a GGUF without a `nextn` block, omit `--speculative-config`; the backbone
+loads normally without MTP.
+
 ## Tested model coverage
 
 The plugin uses vLLM's model implementations and a generic GGUF weight
@@ -78,6 +90,8 @@ starting points:
 | Text | Gemma 3 | Q4_0 |
 | Text | OLMoE | Q4_0 |
 | Vision-language | Gemma 3 | Q4_0 backbone with F16 projector |
+| Vision-language | Qwen 3.5 | Q4_K_M backbone with BF16 projector |
+| Vision-language | Qwen 3.6 | UD-IQ2_XXS backbone with BF16 projector |
 | Image generation | Z-Image-Turbo | Q4_0 |
 | Image generation | FLUX.2-klein | Q8_0 |
 
