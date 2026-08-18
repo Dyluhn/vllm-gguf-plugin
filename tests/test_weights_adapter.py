@@ -9,11 +9,13 @@ import numpy as np
 import pytest
 import torch
 from transformers import PretrainedConfig
+from vllm.config.load import LoadConfig
 
+import vllm_gguf_plugin.loader as loader_module
 import vllm_gguf_plugin.weight_utils as weight_utils_module
-import vllm_gguf_plugin.weights_adapter.base as base_module
 import vllm_gguf_plugin.weights_adapter.gemma3 as gemma3_module
 from vllm_gguf_plugin.gguf_files import GGUFModelFiles
+from vllm_gguf_plugin.loader import GGUFLoadPlan, GGUFModelLoader
 from vllm_gguf_plugin.weight_utils import (
     get_gguf_shard_files,
     gguf_quant_weights_iterator_multi,
@@ -41,10 +43,6 @@ class _TestAdapter(BaseGGUFWeightsAdapter):
             "output_norm.weight": "model.norm.weight",
         }
 
-    def select_tensor_names(self, files, model_config) -> Iterable[str]:
-        del files, model_config
-        return ("token_embd.weight", "output_norm.weight")
-
     def transform_weights(
         self,
         weights: Iterable[GGUFWeight],
@@ -63,75 +61,73 @@ def test_get_gguf_shard_files_rejects_incomplete_set(tmp_path):
         get_gguf_shard_files(str(first))
 
 
-def test_common_prepare_builds_plan_from_all_file_roles(monkeypatch):
+def test_loader_prepare_adapter_builds_plan(monkeypatch):
+    files = GGUFModelFiles(("backbone-1.gguf", "backbone-2.gguf"), "mmproj.gguf")
+    model_config = SimpleNamespace(hf_config=PretrainedConfig())
+    loader = GGUFModelLoader(LoadConfig(load_format="gguf"))
+    adapter = _TestAdapter()
+    adapter.extra_unquantized_modules = ("lm_head",)
+
     seen_files = []
 
-    def fake_unquantized(files):
-        seen_files.extend(files)
+    def fake_unquantized(gguf_files):
+        seen_files.extend(gguf_files)
         return ["token_embd.weight", "output_norm.weight", "ignored.bias"]
 
+    monkeypatch.setattr(loader, "_prepare_model_files", lambda config: files)
+    monkeypatch.setattr(loader_module, "get_weights_adapter", lambda config: adapter)
     monkeypatch.setattr(
-        base_module,
+        loader_module,
+        "get_gguf_tensor_names",
+        lambda paths: {"token_embd.weight"},
+    )
+    monkeypatch.setattr(
+        loader_module,
         "get_gguf_unquantized_params",
         fake_unquantized,
     )
-    monkeypatch.setattr(
-        base_module,
-        "get_gguf_tensor_names",
-        lambda files: {"token_embd.weight"},
-    )
 
-    files = GGUFModelFiles(("backbone-1.gguf", "backbone-2.gguf"), "mmproj.gguf")
-    model_config = SimpleNamespace(hf_config=PretrainedConfig())
+    prepared_adapter, plan = loader._prepare_adapter(model_config)
 
-    plan = _TestAdapter().prepare(files, model_config)
-
+    assert prepared_adapter is adapter
     assert seen_files == list(files.all_files)
     assert plan.files is files
     assert plan.name_map["token_embd.weight"] == "model.embed_tokens.weight"
-    assert plan.selected_tensors == frozenset(
-        {"token_embd.weight", "output_norm.weight"}
-    )
     assert plan.unquantized_modules == (
         "model.embed_tokens",
         "model.norm",
+        "lm_head",
     )
+    assert plan.linear_layouts == {}
     assert model_config.hf_config.tie_word_embeddings is True
 
 
-def test_common_iter_weights_applies_adapter_transform(monkeypatch):
+def test_loader_iter_weights_applies_adapter_transform(monkeypatch):
     tensor = torch.ones(2)
     captured = {}
 
-    def fake_iterator(files, name_map, **kwargs):
-        captured.update(files=files, name_map=name_map, **kwargs)
+    def fake_iterator(gguf_files, name_map):
+        captured.update(files=gguf_files, name_map=name_map)
         return iter([("model.norm.weight", tensor)])
 
     monkeypatch.setattr(
-        base_module,
+        loader_module,
         "gguf_quant_weights_iterator_multi",
         fake_iterator,
     )
     files = GGUFModelFiles(("model.gguf",))
-    plan = base_module.GGUFLoadPlan(
-        files,
-        {},
-        (),
-        selected_tensors=frozenset({"raw.weight"}),
-    )
+    name_map = {"raw.weight": "model.norm.weight"}
+    plan = GGUFLoadPlan(files, name_map, (), {})
+    loader = GGUFModelLoader(LoadConfig(load_format="gguf"))
 
-    weights = list(
-        _TestAdapter().iter_weights(
-            plan,
-            SimpleNamespace(hf_config=PretrainedConfig()),
-        )
-    )
+    weights = list(loader._iter_weights(_TestAdapter(), plan, SimpleNamespace()))
 
     assert weights == [("transformed.model.norm.weight", tensor)]
-    assert captured["selected_tensors"] == frozenset({"raw.weight"})
+    assert captured["files"] == ["model.gguf"]
+    assert captured["name_map"] is name_map
 
 
-def test_weight_iterator_selects_and_preserves_quantized_tensors(monkeypatch):
+def test_weight_iterator_skips_unmapped_quantized_tensors(monkeypatch):
     keep = SimpleNamespace(
         name="keep.weight",
         tensor_type=gguf.GGMLQuantizationType.Q4_0,
@@ -148,7 +144,6 @@ def test_weight_iterator_selects_and_preserves_quantized_tensors(monkeypatch):
         gguf_quant_weights_iterator_multi(
             ["model.gguf"],
             {"keep.weight": "model.keep.weight"},
-            selected_tensors={"keep.weight"},
         )
     )
 

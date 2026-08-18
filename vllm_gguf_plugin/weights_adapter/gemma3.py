@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -60,6 +61,10 @@ def build_gemma3_mapper(is_multimodal: bool) -> WeightsMapper:
     }
 
     return WeightsMapper(
+        orig_to_new_regex={
+            re.compile(r"^(v\.blk\.\d+)\.ffn_up\."): r"\1.mlp.fc2.",
+            re.compile(r"^(v\.blk\.\d+)\.ffn_down\."): r"\1.mlp.fc1.",
+        },
         orig_to_new_prefix=orig_to_new_prefix,
         orig_to_new_substr=orig_to_new_substr,
     )
@@ -94,13 +99,6 @@ class Gemma3GGUFAdapter(BaseGGUFWeightsAdapter):
         hf_names = mapper.apply_list(gguf_names)
         return dict(zip(gguf_names, hf_names, strict=True))
 
-    def transform_module_name(self, module_name: str) -> str:
-        if module_name.startswith("vision_tower") and "mlp.up_proj" in module_name:
-            return module_name.replace("mlp.up_proj", "mlp.fc2")
-        if module_name.startswith("vision_tower") and "mlp.down_proj" in module_name:
-            return module_name.replace("mlp.down_proj", "mlp.fc1")
-        return module_name
-
     def transform_weights(
         self,
         weights: Iterable[GGUFWeight],
@@ -111,6 +109,4 @@ class Gemma3GGUFAdapter(BaseGGUFWeightsAdapter):
         for name, weight in weights:
             if name.endswith("norm.weight") and not name.startswith("vision_tower"):
                 weight = weight - 1
-            module_name, separator, suffix = name.rpartition(".")
-            module_name = self.transform_module_name(module_name)
-            yield f"{module_name}{separator}{suffix}", weight
+            yield name, weight

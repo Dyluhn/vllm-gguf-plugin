@@ -4,7 +4,7 @@ import glob
 import itertools
 import os
 import re
-from collections.abc import Collection, Generator, Iterable
+from collections.abc import Generator, Iterable
 from pathlib import Path
 
 import gguf
@@ -151,8 +151,6 @@ def gguf_quant_weights_iterator(
 def gguf_quant_weights_iterator_multi(
     gguf_files: list[str],
     gguf_to_hf_name_map: dict[str, str] | None = None,
-    *,
-    selected_tensors: Collection[str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Yield ``(name, tensor)`` for all tensors in *gguf_files*.
 
@@ -166,9 +164,6 @@ def gguf_quant_weights_iterator_multi(
     for gguf_file in gguf_files:
         reader = gguf.GGUFReader(gguf_file)
         for tensor in reader.tensors:
-            if selected_tensors is not None and tensor.name not in selected_tensors:
-                continue
-
             if gguf_to_hf_name_map is not None:
                 if tensor.name not in gguf_to_hf_name_map:
                     continue

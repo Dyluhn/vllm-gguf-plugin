@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from ..gguf_files import GGUFModelFiles
-from .base import BaseGGUFWeightsAdapter, GGUFLoadPlan
+from .base import BaseGGUFWeightsAdapter
 from .diffusion import (
     DiffusionGGUFAdapter,
     Flux2KleinDiffusionGGUFAdapter,
@@ -43,7 +43,6 @@ __all__ = [
     "BaseGGUFWeightsAdapter",
     "DiffusionGGUFAdapter",
     "Flux2KleinDiffusionGGUFAdapter",
-    "GGUFLoadPlan",
     "GGUFModelFiles",
     "Gemma3GGUFAdapter",
     "OLMoEGGUFAdapter",
