@@ -68,9 +68,7 @@ class GGUFHeadTilingLayout:
         if dim < 0:
             dim += weight.ndim
         if not 0 <= dim < weight.ndim:
-            raise ValueError(
-                f"Invalid dimension {dim} for shape {tuple(weight.shape)}"
-            )
+            raise ValueError(f"Invalid dimension {dim} for shape {tuple(weight.shape)}")
 
         head_dim = self.head_dim if head_dim is None else head_dim
         if head_dim <= 0:

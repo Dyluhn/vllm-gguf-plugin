@@ -120,6 +120,4 @@ class GGUFConfig(QuantizationConfig):
         if self.linear_layouts:
             layouts = self.linear_layouts
             mapped_names = hf_to_vllm_mapper.apply_list(list(layouts))
-            self.linear_layouts = dict(
-                zip(mapped_names, layouts.values(), strict=True)
-            )
+            self.linear_layouts = dict(zip(mapped_names, layouts.values(), strict=True))
