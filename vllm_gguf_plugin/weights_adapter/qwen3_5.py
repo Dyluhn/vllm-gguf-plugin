@@ -408,6 +408,21 @@ class Qwen35MtpGGUFAdapter(BaseGGUFWeightsAdapter):
             )
         return name_map
 
+    def get_unquantized_modules(
+        self,
+        files: GGUFModelFiles,
+        name_map: dict[str, str],
+        selected_tensors: frozenset[str] | None,
+    ) -> tuple[str, ...]:
+        # The draft never loads embed_tokens/lm_head from GGUF; they are
+        # shared from the target model after loading. Keep them ordinary
+        # vocab modules so they never expect GGUF weights.
+        return (
+            *super().get_unquantized_modules(files, name_map, selected_tensors),
+            "embed_tokens",
+            "lm_head",
+        )
+
     def transform_weights(
         self,
         weights: Iterable[GGUFWeight],

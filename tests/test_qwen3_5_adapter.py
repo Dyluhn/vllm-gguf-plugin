@@ -18,6 +18,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 
+import vllm_gguf_plugin.weights_adapter.base as base_module
 import vllm_gguf_plugin.weights_adapter.qwen3_5 as qwen_module
 from vllm_gguf_plugin.gguf_files import GGUFModelFiles
 from vllm_gguf_plugin.quantization.config import GGUFConfig
@@ -545,3 +546,20 @@ def test_mtp_transform_keeps_quantized_params():
         torch.ones(8, 4),
     )
     assert output["mtp.layers.0.self_attn.q_proj.qweight_type"] == 14
+
+
+def test_mtp_marks_shared_vocab_modules_unquantized(monkeypatch):
+    # The draft shares embed_tokens/lm_head from the target model instead of
+    # loading them from GGUF, so they must stay unquantized vocab modules.
+    monkeypatch.setattr(
+        base_module, "get_gguf_unquantized_params", lambda files: []
+    )
+
+    modules = Qwen35MtpGGUFAdapter().get_unquantized_modules(
+        GGUFModelFiles(("model.gguf",)),
+        name_map={},
+        selected_tensors=None,
+    )
+
+    assert "embed_tokens" in modules
+    assert "lm_head" in modules
