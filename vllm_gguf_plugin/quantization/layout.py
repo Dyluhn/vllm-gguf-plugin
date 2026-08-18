@@ -111,67 +111,45 @@ class GGUFHeadTilingLayout:
     ) -> torch.Tensor:
         """Select this rank's groups from every stored head tile.
 
-        The weight may contain scalar values or packed GGML blocks. Offsets are
-        computed in logical elements and converted to packed bytes, so
+        The weight may contain scalar values or packed GGML blocks. Sharding
+        is done on a view tiled as (heads, groups, packed group span), so
         quantized weights stay quantized while being sharded.
         """
-        if not 0 <= tp_rank < tp_size:
-            raise ValueError(f"Invalid TP rank {tp_rank} for TP size {tp_size}")
         if tp_size == 1:
             return weight
-        if block_size <= 0:
-            raise ValueError("block_size must be positive")
 
-        num_heads, remainder = divmod(logical_size, self.head_dim)
-        if remainder or num_heads % self.heads_per_group:
+        num_groups, remainder = divmod(
+            logical_size, self.head_dim * self.heads_per_group
+        )
+        if remainder:
             raise ValueError(
                 f"Cannot shard logical input size {logical_size} with "
                 f"heads_per_group={self.heads_per_group}, "
                 f"head_dim={self.head_dim}"
             )
-        num_groups = num_heads // self.heads_per_group
         local_groups, remainder = divmod(num_groups, tp_size)
         if remainder:
             raise ValueError(
                 f"Cannot divide {num_groups} head groups across TP size {tp_size}"
             )
+        if (local_groups * self.head_dim) % block_size:
+            raise ValueError(
+                f"TP size {tp_size} splits a stored head tile at "
+                f"{local_groups * self.head_dim} logical elements, which is "
+                f"not aligned to GGML block size {block_size}"
+            )
 
-        logical_blocks, remainder = divmod(logical_size, block_size)
+        total_groups = self.heads_per_group * num_groups
+        group_span, remainder = divmod(weight.shape[dim], total_groups)
         if remainder:
             raise ValueError(
-                f"Logical input size {logical_size} is not aligned to GGML "
-                f"block size {block_size}"
-            )
-        packed_block_size, remainder = divmod(weight.shape[dim], logical_blocks)
-        if remainder:
-            raise ValueError(
-                f"Packed weight dimension {weight.shape[dim]} does not match "
-                f"logical input size {logical_size} and block size {block_size}"
+                f"Packed weight dimension {weight.shape[dim]} is not "
+                f"divisible into {total_groups} head groups"
             )
 
-        group_span = local_groups * self.head_dim
-        if group_span % block_size:
-            raise ValueError(
-                f"TP size {tp_size} splits a stored head tile at {group_span} "
-                f"logical elements, which is not aligned to GGML block size "
-                f"{block_size}"
-            )
-
-        shards = []
-        for head in range(self.heads_per_group):
-            logical_offset = head * num_groups * self.head_dim + tp_rank * group_span
-            if logical_offset % block_size:
-                raise ValueError(
-                    f"TP rank {tp_rank} starts at unaligned logical offset "
-                    f"{logical_offset} for GGML block size {block_size}"
-                )
-            block_offset = logical_offset // block_size
-            block_count = group_span // block_size
-            shards.append(
-                weight.narrow(
-                    dim,
-                    block_offset * packed_block_size,
-                    block_count * packed_block_size,
-                )
-            )
-        return torch.cat(shards, dim=dim).contiguous()
+        moved = weight.movedim(dim, 0)
+        tiled = moved.reshape(
+            self.heads_per_group, num_groups, group_span, *moved.shape[1:]
+        )
+        shard = tiled[:, tp_rank * local_groups : (tp_rank + 1) * local_groups]
+        return shard.reshape(-1, *moved.shape[1:]).movedim(0, dim).contiguous()
