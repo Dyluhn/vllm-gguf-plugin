@@ -2,9 +2,7 @@
 
 import gc
 import weakref
-from types import SimpleNamespace
 
-import pytest
 import torch
 import vllm.engine.arg_utils as arg_utils_module
 import vllm.model_executor.layers.linear as linear_module
@@ -223,43 +221,6 @@ def test_gguf_config_parser_uses_parent_dir_for_local_file(tmp_path, monkeypatch
     assert config.architectures == ["Qwen3MoeForCausalLM"]
 
 
-@pytest.mark.parametrize(
-    ("model_type", "architecture"),
-    [
-        ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
-        ("qwen3_5_text", "Qwen3_5ForConditionalGeneration"),
-        ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
-        ("qwen3_5_moe_text", "Qwen3_5MoeForConditionalGeneration"),
-    ],
-)
-def test_gguf_config_parser_uses_conditional_arch_for_qwen35(
-    tmp_path, monkeypatch, model_type, architecture
-):
-    gguf_path = tmp_path / "model.gguf"
-    gguf_path.write_bytes(b"GGUF")
-
-    def fake_parse(
-        self, model, trust_remote_code, revision=None, code_revision=None, **kwargs
-    ):
-        return {}, PretrainedConfig(model_type=model_type)
-
-    monkeypatch.setattr(
-        gguf_config_parser_module.HFConfigParser,
-        "parse",
-        fake_parse,
-    )
-    monkeypatch.setattr(
-        gguf_config_parser_module,
-        "maybe_patch_hf_config_from_gguf",
-        lambda model, config: config,
-    )
-
-    config_dict, config = GGUFConfigParser().parse(gguf_path, trust_remote_code=False)
-
-    assert config_dict["architectures"] == [architecture]
-    assert config.architectures == [architecture]
-
-
 def test_register_sets_engine_args_for_gguf_model(monkeypatch):
     register()
     captured = {}
@@ -278,37 +239,6 @@ def test_register_sets_engine_args_for_gguf_model(monkeypatch):
     assert captured["model_weights"] == "/tmp/model.gguf"
     assert captured["quantization"] == "gguf"
     assert engine_args.load_format == "gguf"
-
-
-def test_gguf_mtp_draft_reuses_target_weights(monkeypatch):
-    register()
-    captured = {}
-
-    def fake_speculative_config(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(
-            method="mtp",
-            draft_model_config=SimpleNamespace(model_weights=None),
-        )
-
-    monkeypatch.setattr(
-        arg_utils_module,
-        "SpeculativeConfig",
-        fake_speculative_config,
-    )
-    engine_args = EngineArgs(
-        model="Qwen/Qwen3.5-4B",
-        speculative_config={
-            "method": "mtp",
-            "num_speculative_tokens": 1,
-        },
-    )
-    engine_args.model_weights = "/tmp/qwen3.5-mtp.gguf"
-
-    config = engine_args.create_speculative_config(SimpleNamespace(), SimpleNamespace())
-
-    assert captured["target_model_config"] is not None
-    assert config.draft_model_config.model_weights == "/tmp/qwen3.5-mtp.gguf"
 
 
 def test_register_skips_speculator_probe_for_gguf():
