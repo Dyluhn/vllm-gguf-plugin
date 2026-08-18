@@ -277,27 +277,11 @@ class TestGGUFModelLoader:
             revision="main",
             hf_config=SimpleNamespace(vision_config=object()),
         )
-        plain_files = GGUFModelFiles(("/cache/model-Q4_0.gguf",))
-        multimodal_files = GGUFModelFiles(
-            ("/cache/model-Q4_0.gguf",),
-            "/cache/mmproj-BF16.gguf",
-        )
-        resolve_calls = []
 
         monkeypatch.setattr(
             loader,
             "_prepare_weights",
             lambda config: "/cache/model-Q4_0.gguf",
-        )
-
-        def fake_resolve(model_path, mm_proj_path=None):
-            resolve_calls.append((model_path, mm_proj_path))
-            return multimodal_files if mm_proj_path is not None else plain_files
-
-        monkeypatch.setattr(
-            loader_module,
-            "resolve_gguf_model_files",
-            fake_resolve,
         )
         download_calls = []
 
@@ -309,9 +293,7 @@ class TestGGUFModelLoader:
 
         files = loader._prepare_model_files(model_config)
 
-        assert files is multimodal_files
+        assert files == GGUFModelFiles(
+            ("/cache/model-Q4_0.gguf",), "/cache/mmproj-BF16.gguf"
+        )
         assert download_calls == [("org/model", None, "main")]
-        assert resolve_calls == [
-            ("/cache/model-Q4_0.gguf", None),
-            ("/cache/model-Q4_0.gguf", "/cache/mmproj-BF16.gguf"),
-        ]

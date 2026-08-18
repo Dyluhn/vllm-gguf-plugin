@@ -16,12 +16,17 @@ from vllm.model_executor.model_loader.utils import (
 )
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-from .gguf_files import GGUFModelFiles, resolve_gguf_model_files
-from .gguf_utils import get_remote_gguf_repo_id, resolve_explicit_mm_proj
+from .gguf_files import GGUFModelFiles
+from .gguf_utils import (
+    detect_gguf_multimodal,
+    get_remote_gguf_repo_id,
+    resolve_explicit_mm_proj,
+)
 from .quantization import GGUFConfig
 from .weight_utils import (
     download_gguf,
     download_mmproj,
+    get_gguf_shard_files,
     get_gguf_tensor_names,
     get_gguf_unquantized_params,
     gguf_quant_weights_iterator_multi,
@@ -116,33 +121,34 @@ class GGUFModelLoader(BaseModelLoader):
         )
 
     def _prepare_model_files(self, model_config: ModelConfig) -> GGUFModelFiles:
-        model_reference = model_config.model_weights or model_config.model
+        """Resolve backbone shards and the optional multimodal projector."""
         model_path = self._prepare_weights(model_config)
-        files = resolve_gguf_model_files(model_path)
+
+        mm_proj = None
         if self._mm_proj_reference is not None:
-            mm_proj_path = resolve_explicit_mm_proj(
+            mm_proj = resolve_explicit_mm_proj(
                 self._mm_proj_reference,
                 model_path,
                 cache_dir=self.load_config.download_dir,
                 revision=model_config.revision,
             )
-            return resolve_gguf_model_files(model_path, mm_proj_path)
-
-        if (
-            files.mm_proj is None
-            and getattr(model_config.hf_config, "vision_config", None) is not None
-        ):
-            repo_id = get_remote_gguf_repo_id(model_reference)
+        elif detected := detect_gguf_multimodal(model_path):
+            mm_proj = str(detected)
+        elif getattr(model_config.hf_config, "vision_config", None) is not None:
+            repo_id = get_remote_gguf_repo_id(
+                model_config.model_weights or model_config.model
+            )
             if repo_id is not None:
-                mm_proj_path = download_mmproj(
+                mm_proj = download_mmproj(
                     repo_id,
                     cache_dir=self.load_config.download_dir,
                     revision=model_config.revision,
                 )
-                if mm_proj_path is not None:
-                    return resolve_gguf_model_files(model_path, mm_proj_path)
 
-        return files
+        return GGUFModelFiles(
+            backbone=tuple(get_gguf_shard_files(model_path)),
+            mm_proj=mm_proj,
+        )
 
     def _prepare_adapter(
         self, model_config: ModelConfig

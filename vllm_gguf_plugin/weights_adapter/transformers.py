@@ -48,10 +48,11 @@ class TransformersGGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         files: GGUFModelFiles,
         model_config: ModelConfig,
     ) -> dict[str, str]:
+        del files
         config = model_config.hf_config
         text_config = config.get_text_config()
         model_type = config.model_type
-        is_multimodal = files.mm_proj is not None
+        is_multimodal = getattr(config, "vision_config", None) is not None
 
         gguf_to_hf_name_map: dict[str, str] = {}
         sideload_params: list[re.Pattern] = []
