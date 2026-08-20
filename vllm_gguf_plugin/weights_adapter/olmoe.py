@@ -64,7 +64,7 @@ class OLMoEGGUFAdapter(BaseGGUFWeightsAdapter):
 
     @classmethod
     def matches(cls, config) -> bool:
-        return config.model_type == "olmoe"
+        return config.model_type in ["olmoe", "mellum"]
 
     def patch_hf_config(
         self,
