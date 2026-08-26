@@ -66,6 +66,14 @@ class BaseGGUFWeightsAdapter(ABC):
         del files, model_config, name_map
         return {}
 
+    def get_ple_offload_prefixes(
+        self,
+        model_config: ModelConfig,
+    ) -> tuple[str, ...]:
+        """Return mapped weight prefixes owned by the PLE CPU worker."""
+        del model_config
+        return ()
+
     def transform_weights(
         self,
         weights: Iterable[GGUFWeight],

@@ -126,6 +126,26 @@ def test_gguf_embedding(
         torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=4e-2)
 
 
+@torch.inference_mode()
+def test_gguf_embedding_iq4_nl_cpu() -> None:
+    hidden_size = 256
+    quant_type = GGMLQuantizationType.IQ4_NL
+    for tensor in get_gguf_sample_tensors(hidden_size, quant_type):
+        qweight = torch.tensor(tensor.data)
+        weight = torch.tensor(dequantize(tensor.data, quant_type)).to(torch.bfloat16)
+        ids = torch.tensor([[0, qweight.shape[0] - 1]], dtype=torch.long)
+
+        output = apply_gguf_embedding(
+            ids,
+            qweight,
+            quant_type,
+            hidden_size,
+            dtype=torch.bfloat16,
+        )
+
+        torch.testing.assert_close(output, torch.embedding(weight, ids))
+
+
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("quant_type", QUANT_TYPES)

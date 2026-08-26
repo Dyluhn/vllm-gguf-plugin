@@ -90,6 +90,14 @@ def _apply_gguf_embedding(
         x_flat = x.flatten()
         assert hidden_size == qweight.shape[1] // type_size * block_size
         quant = torch.index_select(qweight, dim=0, index=x_flat)
+        if qweight.device.type == "cpu":
+            weight_type = WeightType(qweight_type)
+            dequant = torch.from_numpy(
+                gguf.dequantize(quant.contiguous().numpy(), weight_type)
+            )
+            if dtype is not None:
+                dequant = dequant.to(dtype)
+            return dequant.view(*x.shape, hidden_size)
         dequant = ops.ggml_dequantize(
             quant, qweight_type, hidden_size, x_flat.shape[0], dtype
         )

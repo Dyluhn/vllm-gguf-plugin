@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 
 import torch
 import torch.nn as nn
+import vllm.envs as envs
 from huggingface_hub import ResolvedRevision, hf_hub_download
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
@@ -187,11 +188,36 @@ class GGUFModelLoader(BaseModelLoader):
         plan: GGUFLoadPlan,
         model_config: ModelConfig,
     ):
+        include_prefixes: tuple[str, ...] = ()
+        exclude_prefixes: tuple[str, ...] = ()
+        if getattr(envs, "VLLM_PLE_CPU_OFFLOAD", False):
+            ple_prefixes = adapter.get_ple_offload_prefixes(model_config)
+            if ple_prefixes:
+                from vllm.model_executor.layers.ple_offload_layer import (
+                    is_offload_process,
+                )
+
+                if is_offload_process():
+                    include_prefixes = ple_prefixes
+                else:
+                    exclude_prefixes = ple_prefixes
         weights = gguf_quant_weights_iterator_multi(
             list(plan.files.all_files),
             plan.name_map,
+            include_prefixes=include_prefixes,
+            exclude_prefixes=exclude_prefixes,
         )
         return adapter.transform_weights(weights, model_config)
+
+    def get_all_weights(
+        self,
+        model_config: ModelConfig,
+        model: nn.Module,
+    ):
+        """Expose a filtered stream for vLLM's PLE CPU-offload worker."""
+        del model
+        adapter, plan = self._prepare_adapter(model_config)
+        return self._iter_weights(adapter, plan, model_config)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_model_files(model_config)

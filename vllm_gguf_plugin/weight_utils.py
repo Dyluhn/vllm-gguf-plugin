@@ -151,13 +151,17 @@ def gguf_quant_weights_iterator(
 def gguf_quant_weights_iterator_multi(
     gguf_files: list[str],
     gguf_to_hf_name_map: dict[str, str] | None = None,
+    *,
+    include_prefixes: tuple[str, ...] = (),
+    exclude_prefixes: tuple[str, ...] = (),
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Yield ``(name, tensor)`` for all tensors in *gguf_files*.
 
     When *gguf_to_hf_name_map* is ``None``, raw GGUF tensor names are used
     directly (useful when a caller will apply a :class:`WeightsMapper`
-    afterwards).  When a mapping is provided, tensors not present in the map
-    are skipped and names are translated accordingly.
+    afterwards). When a mapping is provided, tensors not present in the map
+    are skipped and names are translated accordingly. Prefix filters are
+    evaluated before the tensor payload is materialized as a torch tensor.
     """
     _QUANT_TYPES = ("F32", "BF16", "F16")
 
@@ -170,6 +174,11 @@ def gguf_quant_weights_iterator_multi(
                 name = gguf_to_hf_name_map[tensor.name]
             else:
                 name = tensor.name
+
+            if include_prefixes and not name.startswith(include_prefixes):
+                continue
+            if exclude_prefixes and name.startswith(exclude_prefixes):
+                continue
 
             weight_type = tensor.tensor_type
             if weight_type.name not in _QUANT_TYPES:
