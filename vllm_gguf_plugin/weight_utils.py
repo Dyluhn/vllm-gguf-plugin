@@ -1,3 +1,4 @@
+# R9V modification: Qwen3.8 Flash Next GGUF/ROCm integration.
 # SPDX-License-Identifier: Apache-2.0
 
 import glob
@@ -15,6 +16,20 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
+
+
+def _replace_weight_leaf(name: str, replacement: str) -> str:
+    """Replace only the terminal ``weight`` path component.
+
+    Module names may themselves contain the word ``weight`` (for example,
+    Qwen4Exp's ``input_mix_weight_down``).  A global string replacement
+    corrupts those module names while synthesizing GGUF ``qweight`` metadata.
+    """
+    if name == "weight":
+        return replacement
+    if name.endswith(".weight"):
+        return f"{name[: -len('weight')]}{replacement}"
+    raise ValueError(f"Expected a GGUF weight name ending in '.weight', got {name!r}")
 
 
 def download_gguf(
@@ -182,17 +197,25 @@ def gguf_quant_weights_iterator_multi(
 
             weight_type = tensor.tensor_type
             if weight_type.name not in _QUANT_TYPES:
-                yield name.replace("weight", "qweight_type"), torch.tensor(weight_type)
-                name = name.replace("weight", "qweight")
+                yield _replace_weight_leaf(name, "qweight_type"), torch.tensor(
+                    weight_type
+                )
+                name = _replace_weight_leaf(name, "qweight")
 
             weight = tensor.data
             if weight_type.name == "BF16" and weight.dtype == np.uint8:
                 weight = weight.view(np.uint16)
                 if reader.byte_order == "S":
                     weight = weight.byteswap()
-                param = torch.tensor(weight).view(torch.bfloat16)
+                param = torch.from_numpy(weight).view(torch.bfloat16)
             else:
-                param = torch.tensor(weight)
+                # Keep the GGUF mmap as the read-only staging buffer.  The
+                # destination parameter loaders copy from it as needed.  A
+                # eager torch.tensor() copy is especially costly for Qwen4Exp:
+                # its one packed PLE table is about 27 GiB, so copying here
+                # creates a redundant full-table anonymous allocation before
+                # the CPU PLE parameter is even materialized.
+                param = torch.from_numpy(weight)
             yield name, param
 
 

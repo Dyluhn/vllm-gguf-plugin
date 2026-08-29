@@ -1,3 +1,4 @@
+# R9V modification: Qwen3.8 Flash Next GGUF/ROCm integration.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -24,6 +25,8 @@ from .params import (
     _gguf_embedding_weight_type_loader,
     _materialize_gguf_weight_parameter,
     _materialize_gguf_weight_type_parameter,
+    maybe_trim_file_backed_embedding,
+    prepare_file_backed_embedding_access,
 )
 from .utils import DEQUANT_TYPES, UNQUANTIZED_TYPES
 
@@ -197,6 +200,18 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
         qweight = layer.qweight
         qweight_type = layer.qweight_type.weight_type
         hidden_size = qweight.tensor_shape[1]
+        # The detached PLE offload worker intentionally owns this embedding on
+        # CPU.  The custom op is registered for the accelerator dispatch key
+        # so that GPU execution remains visible to torch.compile; invoking it
+        # with CPU tensors cannot dispatch.  Execute the same implementation
+        # directly for the worker's selected-row dequantization path.
+        if qweight.device.type == "cpu":
+            prepare_file_backed_embedding_access(layer, x)
+            result = _apply_gguf_embedding(
+                x, qweight, qweight_type, hidden_size, dtype=self.params_dtype
+            )
+            maybe_trim_file_backed_embedding(layer, x.numel())
+            return result
         return apply_gguf_embedding_op(
             x, qweight, qweight_type, hidden_size, dtype=self.params_dtype
         )

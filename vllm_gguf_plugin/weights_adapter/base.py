@@ -1,3 +1,4 @@
+# R9V modification: Qwen3.8 Flash Next GGUF/ROCm integration.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -65,6 +66,16 @@ class BaseGGUFWeightsAdapter(ABC):
         """Describe layouts required by GGUF linear weights."""
         del files, model_config, name_map
         return {}
+
+    def get_additional_unquantized_modules(
+        self,
+        files: GGUFModelFiles,
+        model_config: ModelConfig,
+        name_map: dict[str, str],
+    ) -> tuple[str, ...]:
+        """Return model-specific modules that must load dense weights."""
+        del files, model_config, name_map
+        return ()
 
     def get_ple_offload_prefixes(
         self,

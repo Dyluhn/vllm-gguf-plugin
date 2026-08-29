@@ -1,3 +1,4 @@
+# R9V modification: Qwen3.8 Flash Next GGUF/ROCm integration.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
@@ -9,7 +10,7 @@ import torch
 import torch.nn as nn
 import vllm.envs as envs
 from huggingface_hub import ResolvedRevision, hf_hub_download
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import ModelConfig, VllmConfig, replace
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
@@ -41,6 +42,33 @@ if TYPE_CHECKING:
     from .quantization.layout import GGUFLinearLayout
 
 logger = init_logger(__name__)
+
+
+def _is_inactive_single_rank_mtp(
+    vllm_config: VllmConfig,
+    model_config: ModelConfig,
+) -> bool:
+    owner = os.environ.get("VLLM_QWEN4_EXP_MTP_OWNER_RANK")
+    if owner is None or "Qwen4ExpMTP" not in model_config.architectures:
+        return False
+    speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is None
+        or speculative_config.draft_parallel_config.tensor_parallel_size != 1
+    ):
+        raise ValueError(
+            "VLLM_QWEN4_EXP_MTP_OWNER_RANK requires draft_tensor_parallel_size=1"
+        )
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
+
+    owner_rank = int(owner)
+    tp_size = get_tensor_model_parallel_world_size()
+    if not 0 <= owner_rank < tp_size:
+        raise ValueError(f"MTP owner rank {owner_rank} is outside TP size {tp_size}")
+    return get_tensor_model_parallel_rank() != owner_rank
 
 
 class GGUFLoadPlan(NamedTuple):
@@ -174,8 +202,14 @@ class GGUFModelLoader(BaseModelLoader):
         )
 
         name_map = adapter.build_name_map(files, model_config)
-        unquantized_modules = _get_unquantized_modules(files, name_map) + tuple(
-            adapter.extra_unquantized_modules
+        unquantized_modules = (
+            _get_unquantized_modules(files, name_map)
+            + tuple(adapter.extra_unquantized_modules)
+            + adapter.get_additional_unquantized_modules(
+                files,
+                model_config,
+                name_map,
+            )
         )
         linear_layouts = adapter.get_linear_layouts(files, model_config, name_map)
         return adapter, GGUFLoadPlan(
@@ -232,28 +266,65 @@ class GGUFModelLoader(BaseModelLoader):
         device_config = vllm_config.device_config
         adapter, plan = self._prepare_adapter(model_config)
         logger.debug("GGUF unquantized modules: %s", plan.unquantized_modules)
-        vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
-        vllm_config.quant_config.unquantized_modules.extend(plan.unquantized_modules)
-        vllm_config.quant_config.register_linear_layouts(
+        model_vllm_config = vllm_config
+        speculative_config = vllm_config.speculative_config
+        is_draft_model = (
+            speculative_config is not None
+            and model_config is speculative_config.draft_model_config
+        )
+        if is_draft_model:
+            model_vllm_config = replace(vllm_config, model_config=model_config)
+            # GGUF carries its quantization layout in the weights themselves,
+            # so resolving a checkpoint-side quantization config is both
+            # unnecessary and wrong for a local draft GGUF path (the generic
+            # resolver tries to treat the file path as a Hub repository).
+            model_vllm_config.quant_config = GGUFConfig()
+        model_vllm_config.quant_config = cast(
+            GGUFConfig, model_vllm_config.quant_config
+        )
+        model_vllm_config.quant_config.unquantized_modules.extend(
+            plan.unquantized_modules
+        )
+        model_vllm_config.quant_config.register_linear_layouts(
             plan.linear_layouts,
             prefix=prefix,
         )
 
-        target_device = torch.device(device_config.device)
+        inactive_mtp_rank = _is_inactive_single_rank_mtp(
+            model_vllm_config, model_config
+        )
+        target_device = torch.device(
+            "meta" if inactive_mtp_rank else device_config.device
+        )
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = initialize_model(
-                    vllm_config=vllm_config,
+                    vllm_config=model_vllm_config,
                     model_config=model_config,
                     prefix=prefix,
                 )
                 recursive_replace_vocab_modules(
                     model,
-                    vllm_config.quant_config,
+                    model_vllm_config.quant_config,
                     prefix=prefix,
                 )
+            if inactive_mtp_rank:
+                logger.info(
+                    "Leaving the Qwen4Exp MTP core on meta for inactive TP rank"
+                )
+                return model
             model.load_weights(
                 self._iter_weights(adapter, plan, model_config),
             )
             process_weights_after_loading(model, model_config, target_device)
+            # The hot/cold manifest describes the 48-layer target backbone.
+            # Qwen4Exp's one-layer MTP draft is loaded through this same GGUF
+            # loader, but has a different layer namespace and must remain on
+            # its normal resident path.
+            if not is_draft_model:
+                from .quantization.tiered_experts import (
+                    materialize_hot_expert_cache,
+                )
+
+                materialize_hot_expert_cache(model)
         return model
