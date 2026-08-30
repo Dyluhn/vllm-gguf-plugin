@@ -39,6 +39,7 @@ from .utils import (
 _DENSE_MMVQ_HIP = None
 _LOGGED_REUSE_SHAPES: set[tuple[str, int, int]] = set()
 _GFX1201_DEVICE_CACHE: dict[int, bool] = {}
+_PROFILE_DENSE_SHAPES = os.environ.get("QWEN38_PROFILE_DENSE_SHAPES") == "1"
 
 # Runtime (N, K) after TP sharding.  This first arm deliberately covers only
 # the five largest dense tensor families in the Qwen3.8 Q4 target: Q/K/V or
@@ -229,7 +230,7 @@ def _fused_qwen38_hc_up_mix_fake(
     return raw_lora.new_empty((raw_lora.shape[0], xn.shape[1] // hc_count))
 
 
-def _fused_mul_mat_gguf(
+def _fused_mul_mat_gguf_impl(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
     if qweight_type in IMATRIX_QUANT_TYPES:
@@ -379,6 +380,19 @@ def _fused_mul_mat_gguf(
     if _needs_q8_finite_guard(x, qweight, qweight_type):
         y.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
     return y
+
+
+def _fused_mul_mat_gguf(
+    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
+) -> torch.Tensor:
+    if not _PROFILE_DENSE_SHAPES:
+        return _fused_mul_mat_gguf_impl(x, qweight, qweight_type)
+    label = (
+        f"qwen38_dense_q{int(qweight_type)}_m{x.shape[0]}_"
+        f"n{qweight.shape[0]}_k{x.shape[1]}"
+    )
+    with torch.profiler.record_function(label):
+        return _fused_mul_mat_gguf_impl(x, qweight, qweight_type)
 
 
 def _needs_q8_vision_dequant_fallback(

@@ -84,6 +84,19 @@ def test_tiered_reuse3_variant_is_explicit_opt_in(monkeypatch) -> None:
     assert gguf_fused_moe_module._tiered_iq_moe_variant() == ("reuse3v2", 31)
 
 
+def test_tiered_prefill_group_size_is_strict(monkeypatch) -> None:
+    monkeypatch.delenv("QWEN38_TIERED_PREFILL_GROUP_SIZE", raising=False)
+    assert gguf_fused_moe_module._tiered_prefill_group_size() == 0
+
+    for group_size in (4, 8, 16):
+        monkeypatch.setenv("QWEN38_TIERED_PREFILL_GROUP_SIZE", str(group_size))
+        assert gguf_fused_moe_module._tiered_prefill_group_size() == group_size
+
+    monkeypatch.setenv("QWEN38_TIERED_PREFILL_GROUP_SIZE", "12")
+    with pytest.raises(RuntimeError, match="must be 0, 4, 8, or 16"):
+        gguf_fused_moe_module._tiered_prefill_group_size()
+
+
 def test_tiered_cache_defaults_off_and_is_rank1_only(monkeypatch) -> None:
     monkeypatch.delenv("QWEN38_TIERED_EXPERT_CACHE_SLOTS", raising=False)
     monkeypatch.delenv("QWEN38_TIERED_EXPERT_CACHE_RANKS", raising=False)
@@ -277,9 +290,7 @@ def test_qwen38_q8_attention_m3_gate_is_default_off_and_strict(
     assert not gguf_linear_module._use_qwen38_q8_attention_m3(x, qweight, 8)
 
     monkeypatch.setenv("QWEN38_USE_DENSE_MMVQ_Q8_ATTN_M3", "1")
-    assert not gguf_linear_module._use_qwen38_q8_attention_m3(
-        x[:2], qweight, 8
-    )
+    assert not gguf_linear_module._use_qwen38_q8_attention_m3(x[:2], qweight, 8)
     assert not gguf_linear_module._use_qwen38_q8_attention_m3(
         x, torch.empty((8192, 1), dtype=torch.int8), 8
     )
@@ -291,19 +302,13 @@ def test_qwen38_q8_attention_m3_gate_is_default_off_and_strict(
 
 
 def test_qwen38_q8_attention_m3_variant_is_validated(monkeypatch) -> None:
-    monkeypatch.delenv(
-        "QWEN38_DENSE_MMVQ_Q8_ATTN_M3_VARIANT", raising=False
-    )
+    monkeypatch.delenv("QWEN38_DENSE_MMVQ_Q8_ATTN_M3_VARIANT", raising=False)
     assert gguf_linear_module._qwen38_q8_attention_m3_variant() == 2
 
-    monkeypatch.setenv(
-        "QWEN38_DENSE_MMVQ_Q8_ATTN_M3_VARIANT", "group4-w8"
-    )
+    monkeypatch.setenv("QWEN38_DENSE_MMVQ_Q8_ATTN_M3_VARIANT", "group4-w8")
     assert gguf_linear_module._qwen38_q8_attention_m3_variant() == 4
 
-    monkeypatch.setenv(
-        "QWEN38_DENSE_MMVQ_Q8_ATTN_M3_VARIANT", "not-a-variant"
-    )
+    monkeypatch.setenv("QWEN38_DENSE_MMVQ_Q8_ATTN_M3_VARIANT", "not-a-variant")
     with pytest.raises(ValueError, match="must be one of"):
         gguf_linear_module._qwen38_q8_attention_m3_variant()
 
@@ -318,9 +323,7 @@ def test_qwen38_q8_attention_m3_dispatch_calls_extension(monkeypatch) -> None:
             return torch.zeros((3, rows), dtype=x.dtype)
 
     monkeypatch.setenv("QWEN38_USE_DENSE_MMVQ_Q8_ATTN_M3", "1")
-    monkeypatch.setenv(
-        "QWEN38_DENSE_MMVQ_Q8_ATTN_M3_VARIANT", "group4-w8"
-    )
+    monkeypatch.setenv("QWEN38_DENSE_MMVQ_Q8_ATTN_M3_VARIANT", "group4-w8")
     monkeypatch.setattr(gguf_linear_module, "_is_gfx1201", lambda device: True)
     monkeypatch.setattr(gguf_linear_module, "_DENSE_MMVQ_HIP", FakeExtension())
     x = torch.empty((3, 2560), dtype=torch.bfloat16)
@@ -1063,6 +1066,93 @@ def test_bounded_gguf_embedding_evicts_exact_packed_row_chunks(monkeypatch, tmp_
     assert fadvise_ranges == [(0, 4096, os.POSIX_FADV_DONTNEED)]
     assert residency.tracked_bytes == 4904
     residency.close()
+
+
+def test_mmap_row_readahead_merges_pages_for_packed_rows(monkeypatch, tmp_path):
+    mmap_path = tmp_path / "readahead-packed-rows.bin"
+    mmap_path.write_bytes(bytes(200 * 90))
+    qweight = torch.from_file(
+        str(mmap_path),
+        shared=False,
+        size=200 * 90,
+        dtype=torch.uint8,
+    ).reshape(200, 90)
+    advised_ranges = []
+    monkeypatch.setattr(gguf_params_module, "_native_mmap_readahead", lambda: None)
+    monkeypatch.setattr(
+        gguf_params_module,
+        "_madvise_range",
+        lambda address, nbytes, advice: advised_ranges.append(
+            (address - qweight.data_ptr(), nbytes, advice)
+        ),
+    )
+    readahead = gguf_params_module._MmapRowReadahead(qweight)
+
+    pages, ranges, advised_bytes = readahead.prepare(torch.tensor([45, 45, 137]))
+
+    assert (pages, ranges, advised_bytes) == (3, 2, 3 * 4096)
+    assert advised_ranges == [
+        (0, 8192, gguf_params_module._MADV_WILLNEED),
+        (3 * 4096, 4096, gguf_params_module._MADV_WILLNEED),
+    ]
+    assert readahead.prepare_count == 1
+    assert readahead.advised_pages == 3
+    assert readahead.advised_ranges == 2
+    assert readahead.advised_bytes == 3 * 4096
+
+
+def test_mmap_row_readahead_rejects_invalid_row(tmp_path):
+    mmap_path = tmp_path / "readahead-invalid-row.bin"
+    mmap_path.write_bytes(bytes(100 * 90))
+    qweight = torch.from_file(
+        str(mmap_path),
+        shared=False,
+        size=100 * 90,
+        dtype=torch.uint8,
+    ).reshape(100, 90)
+    readahead = gguf_params_module._MmapRowReadahead(qweight)
+
+    with pytest.raises(IndexError, match=r"outside \[0, 100\)"):
+        readahead.prepare(torch.tensor([100]))
+
+
+def test_ssd_gguf_embedding_prepares_readahead(monkeypatch, tmp_path):
+    mmap_path = tmp_path / "ssd-readahead.bin"
+    mmap_path.write_bytes(bytes(200 * 90))
+    qweight = torch.from_file(
+        str(mmap_path),
+        shared=False,
+        size=200 * 90,
+        dtype=torch.uint8,
+    ).reshape(200, 90)
+    advised_ranges = []
+    monkeypatch.setattr(gguf_params_module, "_native_mmap_readahead", lambda: None)
+    monkeypatch.setattr(
+        gguf_params_module,
+        "_madvise_range",
+        lambda address, nbytes, advice: advised_ranges.append(
+            (address - qweight.data_ptr(), nbytes, advice)
+        ),
+    )
+    layer = SimpleNamespace(
+        qweight=qweight,
+        _vllm_gguf_mmap_path=str(mmap_path),
+        _vllm_gguf_mmap_residency_mode="ssd",
+        _vllm_gguf_mmap_readahead=True,
+        _vllm_gguf_mmap_readahead_state=None,
+    )
+
+    gguf_params_module.prepare_file_backed_embedding_access(
+        layer, torch.tensor([45, 137])
+    )
+
+    assert layer._vllm_gguf_mmap_last_readahead_pages == 3
+    assert layer._vllm_gguf_mmap_last_readahead_ranges == 2
+    assert layer._vllm_gguf_mmap_last_readahead_bytes == 3 * 4096
+    assert advised_ranges == [
+        (0, 8192, gguf_params_module._MADV_WILLNEED),
+        (3 * 4096, 4096, gguf_params_module._MADV_WILLNEED),
+    ]
 
 
 def test_bounded_gguf_embedding_accepts_max_random_prefill_rows(monkeypatch, tmp_path):

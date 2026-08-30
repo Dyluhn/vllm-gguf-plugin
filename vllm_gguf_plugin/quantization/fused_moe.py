@@ -49,6 +49,7 @@ _TIERED_IQ_MOE_VARIANTS = {
 _FUSED_SHARED_EPILOGUE_ENV = "VLLM_GGUF_FUSED_MOE_SHARED_EPILOGUE"
 _TIERED_CACHE_ASYNC_ENV = "QWEN38_TIERED_EXPERT_CACHE_ASYNC"
 _TIERED_CACHE_POLICY_ENV = "QWEN38_TIERED_EXPERT_CACHE_POLICY"
+_TIERED_PREFILL_GROUP_ENV = "QWEN38_TIERED_PREFILL_GROUP_SIZE"
 
 
 def _fused_shared_epilogue_enabled() -> bool:
@@ -79,6 +80,13 @@ def _tiered_cache_policy() -> str:
     if value not in {"second_touch_rr", "lru"}:
         raise RuntimeError(f"{_TIERED_CACHE_POLICY_ENV} must be second_touch_rr or lru")
     return value
+
+
+def _tiered_prefill_group_size() -> int:
+    value = os.environ.get(_TIERED_PREFILL_GROUP_ENV, "0")
+    if value not in {"0", "4", "8", "16"}:
+        raise RuntimeError(f"{_TIERED_PREFILL_GROUP_ENV} must be 0, 4, 8, or 16")
+    return int(value)
 
 
 def _finalize_moe_output(
@@ -304,6 +312,8 @@ def _fused_moe_gguf_impl(
             assert cold_map is not None
             tiered_hip = _tiered_iq_moe_hip()
             variant_name, variant = _tiered_iq_moe_variant()
+            prefill_group_size = _tiered_prefill_group_size()
+            grouped_prefill = prefill_group_size > 0 and num_tokens > 64
             if dynamic_cache:
                 assert cache_w1 is not None
                 assert cache_w2 is not None
@@ -349,7 +359,69 @@ def _fused_moe_gguf_impl(
                     prepare(*prepare_args, cache_pending)
                 else:
                     prepare(*prepare_args)
-            if variant:
+            if grouped_prefill:
+                expected_api = (
+                    "tiered_iq_moe_cached_prefill_grouped"
+                    if dynamic_cache
+                    else "tiered_iq_moe_prefill_grouped"
+                )
+                if not hasattr(tiered_hip, expected_api):
+                    raise RuntimeError(
+                        "The loaded tiered HIP extension does not support "
+                        f"grouped-{prefill_group_size} prefill"
+                    )
+                sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                    moe_align_block_size(topk_ids, prefill_group_size, E)
+                )
+                grouped_api = getattr(tiered_hip, expected_api)
+
+                def tiered_grouped_prefill(
+                    inp, cold, hot, cached, route_k, qtype, out_rows, token_count
+                ):
+                    args = (inp, cold, hot)
+                    if dynamic_cache:
+                        args += (cached,)
+                    return grouped_api(
+                        *args,
+                        hot_map,
+                        cold_map,
+                        *((cache_map,) if dynamic_cache else ()),
+                        sorted_token_ids,
+                        expert_ids,
+                        num_tokens_post_padded,
+                        route_k,
+                        qtype,
+                        out_rows,
+                        token_count,
+                        prefill_group_size,
+                    )
+
+                logger.info_once(
+                    "Using tiered IQ MoE grouped-%d prefill",
+                    prefill_group_size,
+                )
+                out = tiered_grouped_prefill(
+                    x,
+                    w1,
+                    hot_w1,
+                    cache_w1,
+                    top_k,
+                    qweight_type,
+                    N,
+                    num_tokens,
+                )
+                out = act(out)
+                out = tiered_grouped_prefill(
+                    out,
+                    w2,
+                    hot_w2,
+                    cache_w2,
+                    1,
+                    qweight_type2,
+                    w2.shape[1],
+                    num_tokens * top_k,
+                )
+            elif variant:
                 expected_api = (
                     "tiered_iq_moe_cached_gemv_variant"
                     if dynamic_cache
@@ -430,29 +502,30 @@ def _fused_moe_gguf_impl(
                         token_count,
                     )
 
-            out = tiered_gemv(
-                x,
-                w1,
-                hot_w1,
-                cache_w1,
-                topk_ids,
-                top_k,
-                qweight_type,
-                N,
-                num_tokens,
-            )
-            out = act(out)
-            out = tiered_gemv(
-                out,
-                w2,
-                hot_w2,
-                cache_w2,
-                topk_ids,
-                1,
-                qweight_type2,
-                w2.shape[1],
-                num_tokens * top_k,
-            )
+            if not grouped_prefill:
+                out = tiered_gemv(
+                    x,
+                    w1,
+                    hot_w1,
+                    cache_w1,
+                    topk_ids,
+                    top_k,
+                    qweight_type,
+                    N,
+                    num_tokens,
+                )
+                out = act(out)
+                out = tiered_gemv(
+                    out,
+                    w2,
+                    hot_w2,
+                    cache_w2,
+                    topk_ids,
+                    1,
+                    qweight_type2,
+                    w2.shape[1],
+                    num_tokens * top_k,
+                )
             if async_cache_active:
                 assert cache_map is not None
                 assert cache_tags is not None

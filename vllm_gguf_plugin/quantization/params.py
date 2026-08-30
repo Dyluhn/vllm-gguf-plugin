@@ -33,6 +33,7 @@ _DEFAULT_PLE_MMAP_TRIM_ROWS = 131_072
 _PLE_RESIDENCY_MODE_ENV = "VLLM_PLE_RESIDENCY_MODE"
 _PLE_BOUNDED_BYTES_ENV = "VLLM_PLE_BOUNDED_BYTES"
 _PLE_BOUNDED_CHUNK_BYTES_ENV = "VLLM_PLE_BOUNDED_CHUNK_BYTES"
+_PLE_MMAP_READAHEAD_ENV = "VLLM_PLE_MMAP_READAHEAD"
 _PLE_RSS_LOG_ROWS_ENV = "VLLM_PLE_RSS_LOG_ROWS"
 _DEFAULT_PLE_BOUNDED_BYTES = 4 * 1024**3
 _DEFAULT_PLE_BOUNDED_CHUNK_BYTES = 4096
@@ -42,6 +43,7 @@ _UVA_HOST_COHERENCE_ENV = "RADIANCE_UVA_HOST_COHERENCE"
 _HIP_HOST_MALLOC_COHERENT = 0x40000000
 _HIP_HOST_MALLOC_NONCOHERENT = 0x80000000
 _MADV_RANDOM = 1
+_MADV_WILLNEED = 3
 _MADV_DONTNEED = 4
 _MADV_DONTDUMP = 16
 
@@ -233,6 +235,15 @@ def _madvise_range(address: int, nbytes: int, advice: int) -> None:
         raise OSError(error_number, os.strerror(error_number))
 
 
+@functools.cache
+def _native_mmap_readahead():
+    try:
+        from vllm_gguf_plugin import _C_gguf
+    except ImportError:
+        return None
+    return getattr(_C_gguf, "mmap_readahead", None)
+
+
 def _positive_env_int(name: str, default: int) -> int:
     text = os.environ.get(name, str(default))
     try:
@@ -242,6 +253,13 @@ def _positive_env_int(name: str, default: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be positive, got {value}")
     return value
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    text = os.environ.get(name, "1" if default else "0")
+    if text not in {"0", "1"}:
+        raise ValueError(f"{name} must be 0 or 1, got {text!r}")
+    return text == "1"
 
 
 def _ple_residency_mode() -> str:
@@ -428,6 +446,91 @@ class _BoundedMmapResidency:
         self._fd_finalizer()
 
 
+class _MmapRowReadahead:
+    """Batch page advice for sparse rows in a file-backed tensor.
+
+    The GGUF PLE table packs each row into 90 bytes. A lookup may therefore
+    touch one or two filesystem pages per row. Issuing one merged WILLNEED
+    range per adjacent run lets the kernel submit the SSD reads before
+    ``index_select`` synchronously faults the selected rows.
+    """
+
+    def __init__(self, tensor: torch.Tensor) -> None:
+        if tensor.device.type != "cpu" or not tensor.is_contiguous():
+            raise ValueError("PLE mmap readahead requires a contiguous CPU tensor")
+        if tensor.ndim < 2 or tensor.shape[0] <= 0:
+            raise ValueError("PLE mmap readahead requires a nonempty row tensor")
+        self.address = tensor.data_ptr()
+        self.nbytes = tensor.numel() * tensor.element_size()
+        self.row_nbytes = tensor[0].numel() * tensor.element_size()
+        if tensor.stride(0) * tensor.element_size() != self.row_nbytes:
+            raise ValueError("PLE mmap readahead requires packed contiguous rows")
+        self.num_rows = tensor.shape[0]
+        self.page_bytes = os.sysconf("SC_PAGE_SIZE")
+        if self.address % self.page_bytes:
+            raise ValueError("PLE mmap readahead requires a page-aligned mapping")
+        self._owner_thread_id = threading.get_ident()
+        self.prepare_count = 0
+        self.advised_pages = 0
+        self.advised_ranges = 0
+        self.advised_bytes = 0
+
+    def prepare(self, row_ids: torch.Tensor) -> tuple[int, int, int]:
+        if threading.get_ident() != self._owner_thread_id:
+            raise RuntimeError("PLE mmap readahead is single-owner")
+        rows = row_ids.detach().reshape(-1).tolist()
+        native_readahead = _native_mmap_readahead()
+        if native_readahead is not None:
+            pages, ranges, advised_bytes = native_readahead(
+                self.address,
+                self.nbytes,
+                self.row_nbytes,
+                self.num_rows,
+                rows,
+            )
+            self.prepare_count += 1
+            self.advised_pages += pages
+            self.advised_ranges += ranges
+            self.advised_bytes += advised_bytes
+            return pages, ranges, advised_bytes
+
+        pages: set[int] = set()
+        for row in rows:
+            if not 0 <= row < self.num_rows:
+                raise IndexError(f"PLE mmap row {row} is outside [0, {self.num_rows})")
+            row_start = row * self.row_nbytes
+            first_page = row_start // self.page_bytes
+            final_page = (row_start + self.row_nbytes - 1) // self.page_bytes
+            pages.update(range(first_page, final_page + 1))
+
+        if not pages:
+            return 0, 0, 0
+        sorted_pages = sorted(pages)
+        range_start = sorted_pages[0]
+        previous = range_start
+        ranges: list[tuple[int, int]] = []
+        for page in sorted_pages[1:]:
+            if page != previous + 1:
+                ranges.append((range_start, previous + 1))
+                range_start = page
+            previous = page
+        ranges.append((range_start, previous + 1))
+
+        advised_bytes = 0
+        for first_page, end_page in ranges:
+            offset = first_page * self.page_bytes
+            end = min(end_page * self.page_bytes, self.nbytes)
+            length = end - offset
+            _madvise_range(self.address + offset, length, _MADV_WILLNEED)
+            advised_bytes += length
+
+        self.prepare_count += 1
+        self.advised_pages += len(sorted_pages)
+        self.advised_ranges += len(ranges)
+        self.advised_bytes += advised_bytes
+        return len(sorted_pages), len(ranges), advised_bytes
+
+
 def _sample_matches_file_mapping(
     mapped: torch.Tensor,
     loaded_weight: torch.Tensor,
@@ -497,6 +600,11 @@ def _materialize_file_backed_embedding(
     layer._vllm_gguf_mmap_rows_since_rss_log = 0
     layer._vllm_gguf_mmap_rss_log_rows = rss_log_rows
     layer._vllm_gguf_mmap_trim_count = 0
+    layer._vllm_gguf_mmap_readahead = _env_flag(
+        _PLE_MMAP_READAHEAD_ENV,
+        residency_mode in {"ssd", "bounded"},
+    )
+    layer._vllm_gguf_mmap_readahead_state = None
     if residency_mode == "ssd":
         layer._vllm_gguf_mmap_trim_rows = _positive_env_int(
             _PLE_MMAP_TRIM_ROWS_ENV,
@@ -536,12 +644,13 @@ def _materialize_file_backed_embedding(
         logger.warning("Could not apply mmap advice to %s", mmap_path, exc_info=True)
     logger.info(
         "Using file-backed GGUF embedding: path=%s bytes=%d policy=%s "
-        "trim_rows=%d rss_log_rows=%d mapping_rss_bytes=%d "
+        "trim_rows=%d readahead=%s rss_log_rows=%d mapping_rss_bytes=%d "
         "process_rss_bytes=%d",
         mmap_path,
         expected_bytes,
         residency_mode,
         layer._vllm_gguf_mmap_trim_rows,
+        layer._vllm_gguf_mmap_readahead,
         rss_log_rows,
         _mapping_rss_bytes(mapped),
         _process_rss_bytes(),
@@ -553,31 +662,52 @@ def prepare_file_backed_embedding_access(
     layer: torch.nn.Module,
     row_ids: torch.Tensor,
 ) -> None:
-    """Evict bounded-mode cold chunks before the selected rows are faulted in."""
-    if getattr(layer, "_vllm_gguf_mmap_residency_mode", None) != "bounded":
+    """Prepare eviction and batched page readahead before selected-row gather."""
+    mode = getattr(layer, "_vllm_gguf_mmap_residency_mode", None)
+    if mode is None:
         return
-    residency = getattr(layer, "_vllm_gguf_mmap_residency", None)
-    if residency is None:
-        residency = _BoundedMmapResidency(
-            layer.qweight,
-            layer._vllm_gguf_mmap_path,
-            layer._vllm_gguf_mmap_bounded_bytes,
-            layer._vllm_gguf_mmap_bounded_chunk_bytes,
-        )
-        layer._vllm_gguf_mmap_residency = residency
+    if mode == "bounded":
+        residency = getattr(layer, "_vllm_gguf_mmap_residency", None)
+        if residency is None:
+            residency = _BoundedMmapResidency(
+                layer.qweight,
+                layer._vllm_gguf_mmap_path,
+                layer._vllm_gguf_mmap_bounded_bytes,
+                layer._vllm_gguf_mmap_bounded_chunk_bytes,
+            )
+            layer._vllm_gguf_mmap_residency = residency
+            logger.info(
+                "PLE mmap bounded residency initialized: path=%s bytes=%d "
+                "budget_bytes=%d chunk_bytes=%d max_chunks=%d",
+                residency.path,
+                residency.nbytes,
+                residency.budget_bytes,
+                residency.chunk_bytes,
+                residency.max_chunks,
+            )
+        new_chunks, evicted_chunks, evicted_bytes = residency.prepare(row_ids)
+        layer._vllm_gguf_mmap_last_new_chunks = new_chunks
+        layer._vllm_gguf_mmap_last_evicted_chunks = evicted_chunks
+        layer._vllm_gguf_mmap_last_evicted_bytes = evicted_bytes
+
+    if not getattr(layer, "_vllm_gguf_mmap_readahead", False):
+        return
+    readahead = getattr(layer, "_vllm_gguf_mmap_readahead_state", None)
+    if readahead is None:
+        readahead = _MmapRowReadahead(layer.qweight)
+        layer._vllm_gguf_mmap_readahead_state = readahead
         logger.info(
-            "PLE mmap bounded residency initialized: path=%s bytes=%d "
-            "budget_bytes=%d chunk_bytes=%d max_chunks=%d",
-            residency.path,
-            residency.nbytes,
-            residency.budget_bytes,
-            residency.chunk_bytes,
-            residency.max_chunks,
+            "PLE mmap row readahead initialized: path=%s bytes=%d "
+            "row_bytes=%d page_bytes=%d",
+            layer._vllm_gguf_mmap_path,
+            readahead.nbytes,
+            readahead.row_nbytes,
+            readahead.page_bytes,
         )
-    new_chunks, evicted_chunks, evicted_bytes = residency.prepare(row_ids)
-    layer._vllm_gguf_mmap_last_new_chunks = new_chunks
-    layer._vllm_gguf_mmap_last_evicted_chunks = evicted_chunks
-    layer._vllm_gguf_mmap_last_evicted_bytes = evicted_bytes
+    pages, ranges, advised_bytes = readahead.prepare(row_ids)
+    layer._vllm_gguf_mmap_last_readahead_pages = pages
+    layer._vllm_gguf_mmap_last_readahead_ranges = ranges
+    layer._vllm_gguf_mmap_last_readahead_bytes = advised_bytes
 
 
 def _log_file_backed_residency(
