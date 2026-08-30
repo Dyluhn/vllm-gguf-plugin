@@ -1,4 +1,5 @@
 // R9V modification: Qwen3.8 Flash Next GGUF/ROCm integration.
+// SPDX-License-Identifier: Apache-2.0 AND MIT
 // copied and adapted from
 // https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmvq.cu
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
