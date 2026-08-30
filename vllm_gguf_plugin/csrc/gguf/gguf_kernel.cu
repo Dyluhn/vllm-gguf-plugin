@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // R9V modification: Qwen3.8 Flash Next GGUF/ROCm integration.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

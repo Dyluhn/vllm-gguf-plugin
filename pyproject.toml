@@ -8,6 +8,7 @@ dynamic = ["version"]
 description = "Out-of-tree GGUF quantization plugin for vLLM"
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.10"
 dependencies = [
     "gguf>=0.17.0",
