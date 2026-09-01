@@ -9,7 +9,7 @@ import os
 import threading
 import weakref
 from collections import OrderedDict
-from functools import wraps
+from functools import partial, wraps
 from math import prod
 from pathlib import Path
 
@@ -24,6 +24,13 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+from .tiered_compaction import (
+    allocate_uva_host_owner,
+    default_pinned_empty,
+    is_tiered_expert_master,
+    plan_uva_host_owner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -875,19 +882,27 @@ def _materialize_parameter_data(
 ) -> None:
     if isinstance(param, UninitializedParameter):
         if getattr(param, "_vllm_is_uva_offloaded", False):
-            mode = _uva_host_coherence()
-            use_explicit_hip = (
-                mode != "default"
-                and bool(torch.version.hip)
-                and getattr(param, "_vllm_uva_pin_memory", False)
+            plan = plan_uva_host_owner(
+                pin_memory=bool(getattr(param, "_vllm_uva_pin_memory", False)),
+                tiered_master=is_tiered_expert_master(param),
             )
-            if use_explicit_hip:
-                cpu_data = _explicit_hip_uva_empty(shape, dtype, mode)
-            else:
-                cpu_data = torch.empty(shape, dtype=dtype, device="cpu")
-            if getattr(param, "_vllm_uva_pin_memory", False) and not use_explicit_hip:
-                cpu_data = cpu_data.pin_memory()
-            accelerator_view = get_accelerator_view_from_cpu_tensor(cpu_data)
+            mode = _uva_host_coherence()
+            pinned_empty = (
+                partial(_explicit_hip_uva_empty, mode=mode)
+                if mode != "default" and bool(torch.version.hip)
+                else default_pinned_empty
+            )
+            cpu_data = allocate_uva_host_owner(
+                shape, dtype, plan, pinned_empty=pinned_empty
+            )
+            # A tiered expert master is only a compaction source, so it keeps
+            # no view: get_accelerator_view_from_cpu_tensor pins unpinned input
+            # internally, which is exactly the cost a pageable master avoids.
+            accelerator_view = (
+                get_accelerator_view_from_cpu_tensor(cpu_data)
+                if plan.accelerator_view
+                else cpu_data
+            )
             # Materialize the Python parameter object without allocating the
             # final tensor on the accelerator, then attach the UVA view.
             param.materialize((0,), device=param.device, dtype=dtype)

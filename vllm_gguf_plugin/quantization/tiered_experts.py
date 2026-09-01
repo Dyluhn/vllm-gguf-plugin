@@ -17,6 +17,12 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from .params import allocate_uva_host_empty
+from .tiered_compaction import (
+    MASTER_ATTR,
+    compact_expert_master,
+    is_tiered_expert_master,
+    validate_expert_master,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +32,7 @@ _CACHE_RANKS_ENV = "QWEN38_TIERED_EXPERT_CACHE_RANKS"
 _CACHE_ASYNC_ENV = "QWEN38_TIERED_EXPERT_CACHE_ASYNC"
 _CACHE_POLICY_ENV = "QWEN38_TIERED_EXPERT_CACHE_POLICY"
 _MAX_CACHE_SLOTS = 16
+_NUM_LAYERS = 48
 _LAYER_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)\.mlp\.experts$")
 
 
@@ -71,7 +78,7 @@ def _validate_hot_lists(manifest: dict, rank: int) -> tuple[int, list[list[int]]
         raise ValueError("Tiered expert manifest must use schema version 1")
     num_layers = manifest.get("num_layers")
     num_experts = manifest.get("num_experts")
-    if num_layers != 48 or num_experts != 512:
+    if num_layers != _NUM_LAYERS or num_experts != 512:
         raise ValueError(
             "Tiered expert manifest must describe 48 layers and 512 experts"
         )
@@ -94,53 +101,114 @@ def _validate_hot_lists(manifest: dict, rank: int) -> tuple[int, list[list[int]]
     return num_experts, hot_lists
 
 
+def tiered_expert_manifest_path() -> str | None:
+    return os.environ.get(_MANIFEST_ENV) or None
+
+
+def tiered_expert_layer_id(layer_name: str | None) -> int | None:
+    """Backbone layer index this expert module compacts, or None."""
+    if not layer_name:
+        return None
+    match = _LAYER_PATTERN.search(layer_name)
+    if match is None:
+        return None
+    layer_id = extract_layer_index(layer_name)
+    if layer_id != int(match.group(1)) or not 0 <= layer_id < _NUM_LAYERS:
+        return None
+    return layer_id
+
+
+def _tiered_expert_modules(model: torch.nn.Module):
+    from .fused_moe import GGUFMoEMethod
+
+    for module in model.modules():
+        if not isinstance(module, RoutedExperts) or not isinstance(
+            getattr(module, "quant_method", None), GGUFMoEMethod
+        ):
+            continue
+        layer_id = tiered_expert_layer_id(module.layer_name)
+        if layer_id is None:
+            continue
+        yield layer_id, module
+
+
+def prepare_tiered_expert_masters(model: torch.nn.Module) -> int:
+    """Load the tiered expert masters into pageable host memory.
+
+    Must run before ``load_weights``. The masters exist only so
+    ``materialize_hot_expert_cache`` can copy the hot rows to the accelerator
+    and the cold rows into their pinned UVA owner, and they are dropped layer
+    by layer as that copy proceeds. Pinning them adds the entire expert set
+    (~27.7 GiB per TP rank) to the pinned startup peak for storage no kernel
+    ever reads.
+    """
+    if tiered_expert_manifest_path() is None:
+        return 0
+    layers = 0
+    for _, module in _tiered_expert_modules(model):
+        for name in ("w13_qweight", "w2_qweight"):
+            setattr(getattr(module, name), MASTER_ATTR, True)
+        layers += 1
+    if layers != _NUM_LAYERS:
+        raise RuntimeError(
+            f"Tiered GGUF expert preparation found {layers} target layers, "
+            f"expected {_NUM_LAYERS}"
+        )
+    return layers
+
+
+def _compaction_device(parameter: torch.nn.Parameter) -> torch.device:
+    if parameter.device.type != "cpu":
+        return parameter.device
+    # A pageable master keeps the parameter on the host until compaction. Its
+    # halves belong on the accelerator this rank loads onto, which is also what
+    # the pinned path's UVA view resolved to.
+    return torch.device("cuda", torch.cuda.current_device())
+
+
 def _compact_expert_parameter(
     parameter: torch.nn.Parameter,
     hot_ids: list[int],
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    if parameter.dtype != torch.uint8 or parameter.dim() != 3:
-        raise TypeError("Tiered GGUF expert weights must be packed uint8 tensors")
-    if parameter.shape[0] != num_experts or not parameter.is_contiguous():
-        raise ValueError("Tiered GGUF expert master has an unexpected layout")
+    validate_expert_master(parameter, num_experts)
     if not getattr(parameter, "_vllm_is_uva_offloaded", False):
         raise RuntimeError("Tiered GGUF expert master was not UVA offloaded")
     cpu_master = getattr(parameter, "_vllm_uva_cpu_data", None)
-    if cpu_master is None or not cpu_master.is_pinned():
+    if cpu_master is None:
+        raise RuntimeError("Tiered GGUF expert master has no CPU owner")
+    if not is_tiered_expert_master(parameter) and not cpu_master.is_pinned():
         raise RuntimeError("Tiered GGUF expert master has no pinned CPU owner")
 
-    device = parameter.device
-    hot_ids_device = torch.tensor(hot_ids, dtype=torch.long, device=device)
-    hot = parameter.index_select(0, hot_ids_device).contiguous()
-
-    hot_set = set(hot_ids)
-    cold_ids = [expert for expert in range(num_experts) if expert not in hot_set]
-    cold_ids_cpu = torch.tensor(cold_ids, dtype=torch.long, device="cpu")
-    cold_owner = allocate_uva_host_empty(
-        (len(cold_ids), *parameter.shape[1:]), parameter.dtype
+    device = _compaction_device(parameter)
+    compacted = compact_expert_master(
+        cpu_master,
+        hot_ids,
+        num_experts,
+        device,
+        cold_empty=allocate_uva_host_empty,
     )
-    torch.index_select(cpu_master, 0, cold_ids_cpu, out=cold_owner)
-
-    hot_map = torch.full((num_experts,), -1, dtype=torch.int32, device=device)
-    cold_map = torch.full((num_experts,), -1, dtype=torch.int32, device=device)
-    hot_map[hot_ids_device] = torch.arange(
-        len(hot_ids), dtype=torch.int32, device=device
-    )
-    cold_ids_device = cold_ids_cpu.to(device=device)
-    cold_map[cold_ids_device] = torch.arange(
-        len(cold_ids), dtype=torch.int32, device=device
-    )
+    del cpu_master
 
     torch.cuda.synchronize(device)
-    cold = get_accelerator_view_from_cpu_tensor(cold_owner)
+    cold = get_accelerator_view_from_cpu_tensor(compacted.cold_owner)
+    # Replacing both references releases this layer's master before the next
+    # layer is compacted.
     parameter.data = cold
-    parameter._vllm_uva_cpu_data = cold_owner
+    parameter._vllm_uva_cpu_data = compacted.cold_owner
     parameter._vllm_is_uva_offloaded = True
-    return hot, hot_map, cold_map, hot.numel(), cold_owner.numel()
+    setattr(parameter, MASTER_ATTR, False)
+    return (
+        compacted.hot,
+        compacted.hot_map,
+        compacted.cold_map,
+        compacted.hot.numel(),
+        compacted.cold_owner.numel(),
+    )
 
 
 def materialize_hot_expert_cache(model: torch.nn.Module) -> None:
-    manifest_path = os.environ.get(_MANIFEST_ENV)
+    manifest_path = tiered_expert_manifest_path()
     if not manifest_path:
         return
     path = Path(manifest_path).resolve(strict=True)
@@ -157,24 +225,14 @@ def materialize_hot_expert_cache(model: torch.nn.Module) -> None:
         )
     physical_cache_slots = cache_slots + int(async_cache)
 
-    from .fused_moe import GGUFMoEMethod, _tiered_iq_moe_hip
+    from .fused_moe import _tiered_iq_moe_hip
 
     layers = 0
     hot_bytes = 0
     cold_bytes = 0
     dynamic_cache_bytes = 0
     async_initialized = False
-    for module in model.modules():
-        if not isinstance(module, RoutedExperts) or not isinstance(
-            getattr(module, "quant_method", None), GGUFMoEMethod
-        ):
-            continue
-        match = _LAYER_PATTERN.search(module.layer_name)
-        if match is None:
-            continue
-        layer_id = extract_layer_index(module.layer_name)
-        if layer_id != int(match.group(1)) or not 0 <= layer_id < 48:
-            continue
+    for layer_id, module in _tiered_expert_modules(model):
         hot_ids = hot_lists[layer_id]
         hot_w13, hot_map, cold_map, w13_hot, w13_cold = _compact_expert_parameter(
             module.w13_qweight, hot_ids, num_experts
@@ -273,10 +331,16 @@ def materialize_hot_expert_cache(model: torch.nn.Module) -> None:
         hot_bytes += w13_hot + w2_hot
         cold_bytes += w13_cold + w2_cold
 
-    if layers != 48:
+    if layers != _NUM_LAYERS:
         raise RuntimeError(
-            f"Tiered GGUF cache found {layers} target layers, expected 48"
+            f"Tiered GGUF cache found {layers} target layers, expected {_NUM_LAYERS}"
         )
+    for name, parameter in model.named_parameters():
+        if is_tiered_expert_master(parameter):
+            raise RuntimeError(
+                f"Tiered GGUF expert master {name} was never compacted and is "
+                "still pageable host memory"
+            )
     host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
     if host_empty_cache is not None:
         host_empty_cache()

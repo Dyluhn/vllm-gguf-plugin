@@ -313,10 +313,6 @@ class GGUFModelLoader(BaseModelLoader):
                     "Leaving the Qwen4Exp MTP core on meta for inactive TP rank"
                 )
                 return model
-            model.load_weights(
-                self._iter_weights(adapter, plan, model_config),
-            )
-            process_weights_after_loading(model, model_config, target_device)
             # The hot/cold manifest describes the 48-layer target backbone.
             # Qwen4Exp's one-layer MTP draft is loaded through this same GGUF
             # loader, but has a different layer namespace and must remain on
@@ -324,7 +320,20 @@ class GGUFModelLoader(BaseModelLoader):
             if not is_draft_model:
                 from .quantization.tiered_experts import (
                     materialize_hot_expert_cache,
+                    prepare_tiered_expert_masters,
                 )
 
+                prepare_tiered_expert_masters(model)
+            model.load_weights(
+                self._iter_weights(adapter, plan, model_config),
+            )
+            if not is_draft_model:
+                # Compaction runs before process_weights_after_loading because
+                # that pass hoists every CPU-resident parameter onto the
+                # accelerator for the duration of the quant hook, and the
+                # pageable expert masters must not make that round trip.
+                # GGUFMoEMethod has no post-load weight processing, so the
+                # order is otherwise immaterial for the expert layers.
                 materialize_hot_expert_cache(model)
+            process_weights_after_loading(model, model_config, target_device)
         return model

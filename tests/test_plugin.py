@@ -36,6 +36,7 @@ import vllm_gguf_plugin.quantization.fused_moe as gguf_fused_moe_module
 import vllm_gguf_plugin.quantization.linear as gguf_linear_module
 import vllm_gguf_plugin.quantization.params as gguf_params_module
 import vllm_gguf_plugin.quantization.route_profile as route_profile_module
+import vllm_gguf_plugin.quantization.tiered_compaction as tiered_compaction_module
 import vllm_gguf_plugin.quantization.tiered_experts as tiered_experts_module
 import vllm_gguf_plugin.quantization.vocal_embeds as gguf_vocab_module
 from vllm_gguf_plugin import OOTGGUFConfig, OOTGGUFModelLoader, register
@@ -670,6 +671,64 @@ def test_gguf_uva_materialization_retains_cpu_storage(monkeypatch) -> None:
 
     assert cpu_storage_ref is not None
     assert cpu_storage_ref() is param._vllm_uva_cpu_data
+    assert tuple(param.shape) == (8, 4)
+
+
+def _record_uva_host_allocations(monkeypatch) -> tuple[list, list]:
+    """Capture the pinned allocations and accelerator views a UVA param makes."""
+    monkeypatch.setenv("RADIANCE_UVA_HOST_COHERENCE", "default")
+    monkeypatch.setenv("RADIANCE_UVA_HOST_NONCOHERENT", "0")
+    pinned: list = []
+    views: list = []
+
+    def fake_pinned_empty(shape, dtype):
+        pinned.append((tuple(shape), dtype))
+        return torch.empty(tuple(shape), dtype=dtype)
+
+    def fake_accelerator_view(cpu_tensor):
+        views.append(cpu_tensor)
+        return torch.empty_like(cpu_tensor)
+
+    monkeypatch.setattr(gguf_params_module, "default_pinned_empty", fake_pinned_empty)
+    monkeypatch.setattr(
+        gguf_params_module,
+        "get_accelerator_view_from_cpu_tensor",
+        fake_accelerator_view,
+    )
+    return pinned, views
+
+
+def test_gguf_tiered_expert_master_stays_pageable(monkeypatch) -> None:
+    pinned, views = _record_uva_host_allocations(monkeypatch)
+
+    param = GGUFUninitializedParameter(requires_grad=False)
+    param._vllm_is_uva_offloaded = True
+    param._vllm_uva_pin_memory = True
+    setattr(param, tiered_compaction_module.MASTER_ATTR, True)
+
+    gguf_params_module._materialize_parameter_data(param, (8, 4), torch.uint8)
+
+    # The master is only a compaction source: no pinned allocation, and no
+    # accelerator view either, since taking one pins unpinned input internally.
+    assert pinned == []
+    assert views == []
+    assert param.device.type == "cpu"
+    assert param.data_ptr() == param._vllm_uva_cpu_data.data_ptr()
+    assert not param._vllm_uva_cpu_data.is_pinned()
+    assert param._vllm_is_uva_offloaded is True
+
+
+def test_gguf_uva_materialization_pins_unmarked_parameters(monkeypatch) -> None:
+    pinned, views = _record_uva_host_allocations(monkeypatch)
+
+    param = GGUFUninitializedParameter(requires_grad=False)
+    param._vllm_is_uva_offloaded = True
+    param._vllm_uva_pin_memory = True
+
+    gguf_params_module._materialize_parameter_data(param, (8, 4), torch.uint8)
+
+    assert pinned == [((8, 4), torch.uint8)]
+    assert len(views) == 1
     assert tuple(param.shape) == (8, 4)
 
 
